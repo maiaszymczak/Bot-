@@ -11,6 +11,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  Routes,
 } from "discord.js";
 
 import {
@@ -39,6 +40,59 @@ if (!GUILD_ID) throw new Error("GUILD_ID manquant (variable d'environnement)");
 
 const ROLE_ID = process.env.BSG_MEMBER_ROLE_ID || null;
 const ROLE_NAME = process.env.BSG_MEMBER_ROLE_NAME || "Membre";
+
+function parseBoolEnv(value, defaultValue = false) {
+  if (value == null) return defaultValue;
+  const s = String(value).trim().toLowerCase();
+  if (!s) return defaultValue;
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return defaultValue;
+}
+
+// IMPORTANT: `guild.members.fetch()` sans argument déclenche une requête Gateway opcode 8
+// (Request Guild Members) qui est fortement rate-limitée. On évite donc par défaut.
+const BSG_STARTUP_SYNC_ENABLED = parseBoolEnv(process.env.BSG_STARTUP_SYNC_ENABLED, true);
+const BSG_STARTUP_SYNC_MODE = String(process.env.BSG_STARTUP_SYNC_MODE ?? "rest").trim().toLowerCase();
+const BSG_CHECKMEMBERS_FETCH_ALL_MEMBERS = parseBoolEnv(
+  process.env.BSG_CHECKMEMBERS_FETCH_ALL_MEMBERS,
+  false
+);
+
+async function listGuildMembersViaRest(guildId) {
+  const out = [];
+  let after = null;
+
+  // Pagination: 1000 max par page.
+  // NOTE: évite l'opcode 8 (gateway) et donc son rate limit.
+  // IMPORTANT: sur très gros serveurs ça peut prendre un peu de temps.
+  for (;;) {
+    const query = new URLSearchParams();
+    query.set("limit", "1000");
+    if (after) query.set("after", after);
+
+    // discord.js REST accepte { query } (URLSearchParams)
+    const page = await client.rest.get(Routes.guildMembers(guildId), { query });
+    if (!Array.isArray(page) || page.length === 0) break;
+
+    out.push(...page);
+
+    const last = page[page.length - 1];
+    const lastId = last?.user?.id;
+    if (!lastId || page.length < 1000) break;
+    after = String(lastId);
+  }
+
+  return out;
+}
+
+function getApiMemberDisplayName(m) {
+  const nick = String(m?.nick ?? "").trim();
+  if (nick) return nick;
+  const globalName = String(m?.user?.global_name ?? "").trim();
+  if (globalName) return globalName;
+  return String(m?.user?.username ?? "").trim();
+}
 
 const STAFF_ROLE_IDS = new Set(
   String(process.env.BSG_STAFF_ROLE_IDS ?? "")
@@ -353,27 +407,83 @@ async function registerGuildCommands() {
 }
 
 async function startupSyncRoleMembers() {
+  if (!BSG_STARTUP_SYNC_ENABLED) {
+    console.log("Startup sync: désactivé (BSG_STARTUP_SYNC_ENABLED=false)");
+    return;
+  }
+
   const { guild, role } = await getGuildAndRole();
   if (!role) {
     console.warn(`Rôle introuvable pour sync: ${ROLE_NAME}`);
     return;
   }
 
-  const members = await guild.members.fetch();
-  const roleMembers = role.members;
-  console.log(`Sync: ${roleMembers.size} membres avec rôle '${role.name}'`);
-
-  // Précharge les données une seule fois pour tout le sync (évite 115 appels API)
-  invalidateSheetCache(joueursSheet);
-
-  let added = 0;
-  for (const member of roleMembers.values()) {
-    const display = member.displayName;
-    if (await addUser(joueursSheet, member.id, display)) added++;
+  const mode = BSG_STARTUP_SYNC_MODE;
+  if (mode === "off" || mode === "disabled" || mode === "false" || mode === "0") {
+    console.log("Startup sync: mode=off");
+    return;
   }
 
-  void members;
-  console.log(`Sync terminé: ajoutés=${added}`);
+  if (mode === "gateway") {
+    // ⚠️ Peut déclencher le rate limit opcode 8.
+    await guild.members.fetch();
+    const roleMembers = role.members;
+    console.log(`Sync (gateway): ${roleMembers.size} membres avec rôle '${role.name}'`);
+
+    invalidateSheetCache(joueursSheet);
+    let added = 0;
+    for (const member of roleMembers.values()) {
+      const display = member.displayName;
+      if (await addUser(joueursSheet, member.id, display)) added++;
+    }
+    console.log(`Sync terminé: ajoutés=${added}`);
+    return;
+  }
+
+  if (mode === "rest") {
+    // Évite l'opcode 8 en listant via REST.
+    let apiMembers;
+    try {
+      apiMembers = await listGuildMembersViaRest(guild.id);
+    } catch (e) {
+      console.warn(`Startup sync (rest) a échoué (${e?.message ?? e}). Fallback mode=cache.`);
+      apiMembers = null;
+    }
+
+    if (apiMembers) {
+      const roleId = role.id;
+      const roleMembers = apiMembers.filter((m) => Array.isArray(m?.roles) && m.roles.includes(roleId));
+      console.log(`Sync (rest): ${roleMembers.length} membres avec rôle '${role.name}'`);
+
+      invalidateSheetCache(joueursSheet);
+      let added = 0;
+      for (const m of roleMembers) {
+        const id = m?.user?.id;
+        if (!id) continue;
+        const display = getApiMemberDisplayName(m);
+        if (await addUser(joueursSheet, String(id), display)) added++;
+      }
+      console.log(`Sync terminé: ajoutés=${added}`);
+      return;
+    }
+  }
+
+  // mode=cache (ou fallback)
+  {
+    const roleMembers = role.members;
+    console.log(`Sync (cache): ${roleMembers.size} membres avec rôle '${role.name}'`);
+    console.log(
+      "Sync (cache): sans fetch global des membres. Si le count est trop bas, mets BSG_STARTUP_SYNC_MODE=rest (recommandé) ou gateway."
+    );
+
+    invalidateSheetCache(joueursSheet);
+    let added = 0;
+    for (const member of roleMembers.values()) {
+      const display = member.displayName;
+      if (await addUser(joueursSheet, member.id, display)) added++;
+    }
+    console.log(`Sync terminé: ajoutés=${added}`);
+  }
 }
 
 client.once("ready", async () => {
@@ -641,11 +751,26 @@ client.on("interactionCreate", async (interaction) => {
         await replyEphemeral(interaction, { content: `Rôle introuvable: ${ROLE_NAME}` });
         return;
       }
-      await guild.members.fetch();
+
+      if (BSG_CHECKMEMBERS_FETCH_ALL_MEMBERS) {
+        try {
+          const apiMembers = await listGuildMembersViaRest(guild.id);
+          const roleId = role.id;
+          const exact = apiMembers.filter((m) => Array.isArray(m?.roles) && m.roles.includes(roleId)).length;
+          const sheetCount = await countRegisteredUsers(joueursSheet);
+          await replyEphemeral(interaction, {
+            content: `Discord (rôle '${role.name}'): ${exact} (exact) | Sheet (IDs enregistrés): ${sheetCount}`,
+          });
+          return;
+        } catch (e) {
+          console.warn(`checkmembers: fetch all members a échoué (${e?.message ?? e}).`);
+        }
+      }
+
       const discordCount = role.members.size;
       const sheetCount = await countRegisteredUsers(joueursSheet);
       await replyEphemeral(interaction, {
-        content: `Discord (rôle '${role.name}'): ${discordCount} | Sheet (IDs enregistrés): ${sheetCount}`,
+        content: `Discord (rôle '${role.name}'): ${discordCount} (cache) | Sheet (IDs enregistrés): ${sheetCount}`,
       });
       return;
     }

@@ -22,9 +22,108 @@ export const COL_ID_DISCORD = 6;
 export const COL_PARTICIPATIONS = 7;
 export const COL_REGEAR = 8;
 
-const CACHE_TTL_MS = 2 * 1000;
+function getCacheTtlMs() {
+  const rawMs = process.env.SHEET_CACHE_TTL_MS;
+  if (rawMs != null && String(rawMs).trim() !== "") {
+    const n = Number(rawMs);
+    if (Number.isFinite(n) && n >= 0) return Math.trunc(n);
+  }
+
+  const rawSec = process.env.SHEET_CACHE_TTL_SECONDS;
+  if (rawSec != null && String(rawSec).trim() !== "") {
+    const n = Number(rawSec);
+    if (Number.isFinite(n) && n >= 0) return Math.trunc(n * 1000);
+  }
+
+  // Par défaut: 60s pour éviter d'exploser le quota lors des sync/rafales.
+  return 60 * 1000;
+}
+
+function getDocCacheTtlMs() {
+  const rawMs = process.env.SHEET_DOC_CACHE_TTL_MS;
+  if (rawMs != null && String(rawMs).trim() !== "") {
+    const n = Number(rawMs);
+    if (Number.isFinite(n) && n >= 0) return Math.trunc(n);
+  }
+  return 15 * 60 * 1000;
+}
+
+function getActivitiesCacheTtlMs() {
+  const rawMs = process.env.SHEET_ACTIVITIES_CACHE_TTL_MS;
+  if (rawMs != null && String(rawMs).trim() !== "") {
+    const n = Number(rawMs);
+    if (Number.isFinite(n) && n >= 0) return Math.trunc(n);
+  }
+  return 60 * 1000;
+}
+
+const CACHE_TTL_MS = getCacheTtlMs();
+const DOC_CACHE_TTL_MS = getDocCacheTtlMs();
+const ACTIVITIES_CACHE_TTL_MS = getActivitiesCacheTtlMs();
+
 const cellCacheExpiry = new Map();
 const cellCacheLoaded = new Map();
+const cellCacheInFlight = new Map();
+
+let docCache = null;
+let docCacheSheetId = null;
+let docCacheLoadedAt = 0;
+let docCacheInFlight = null;
+
+const activitiesCache = new Map();
+const activitiesInFlight = new Map();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getHeader(obj, name) {
+  const h = obj?.response?.headers;
+  if (!h) return null;
+  if (typeof h.get === "function") return h.get(name);
+  return h[name] ?? h[name.toLowerCase()] ?? null;
+}
+
+function getRetryAfterMs(err) {
+  const v = getHeader(err, "retry-after");
+  if (!v) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (Number.isFinite(n) && n >= 0) return Math.trunc(n * 1000);
+  const d = Date.parse(s);
+  if (!Number.isNaN(d)) {
+    const ms = d - Date.now();
+    return ms > 0 ? ms : 0;
+  }
+  return null;
+}
+
+function isRateLimitError(err) {
+  const code = err?.code ?? err?.response?.status ?? err?.response?.statusCode;
+  if (code === 429) return true;
+  const msg = String(err?.message ?? "").toLowerCase();
+  return msg.includes("quota exceeded") || msg.includes("rate limit") || msg.includes("[429]");
+}
+
+async function withSheetsBackoff(fn, { retries = 6, baseDelayMs = 500, maxDelayMs = 15_000 } = {}) {
+  let attempt = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRateLimitError(err) || attempt >= retries) throw err;
+      attempt++;
+
+      const retryAfterMs = getRetryAfterMs(err);
+      const exp = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
+      const jitter = Math.floor(Math.random() * 250);
+      const delay = Math.min(maxDelayMs, retryAfterMs ?? exp + jitter);
+      await sleep(delay);
+    }
+  }
+}
 
 function getCacheKey(sheet) {
   return String(sheet.sheetId);
@@ -34,10 +133,17 @@ function isCacheValid(key) {
   return Date.now() < (cellCacheExpiry.get(key) ?? 0);
 }
 
+function touchCache(sheet) {
+  const key = getCacheKey(sheet);
+  cellCacheExpiry.set(key, Date.now() + CACHE_TTL_MS);
+  cellCacheLoaded.set(key, true);
+}
+
 function invalidateCache(sheet) {
   const key = getCacheKey(sheet);
   cellCacheExpiry.delete(key);
   cellCacheLoaded.delete(key);
+  cellCacheInFlight.delete(key);
 }
 
 export function invalidateSheetCache(sheet) {
@@ -47,9 +153,25 @@ export function invalidateSheetCache(sheet) {
 async function loadFullJoueursSheetCached(sheet) {
   const key = getCacheKey(sheet);
   if (isCacheValid(key)) return;
-  await sheet.loadCells("A:H");
-  cellCacheExpiry.set(key, Date.now() + CACHE_TTL_MS);
-  cellCacheLoaded.set(key, true);
+
+  const inFlight = cellCacheInFlight.get(key);
+  if (inFlight) {
+    await inFlight;
+    return;
+  }
+
+  const p = (async () => {
+    await withSheetsBackoff(() => sheet.loadCells("A:H"));
+    cellCacheExpiry.set(key, Date.now() + CACHE_TTL_MS);
+    cellCacheLoaded.set(key, true);
+  })();
+
+  cellCacheInFlight.set(key, p);
+  try {
+    await p;
+  } finally {
+    cellCacheInFlight.delete(key);
+  }
 }
 
 function getHeaderRows() {
@@ -114,10 +236,33 @@ export async function getDoc() {
   const sheetId = process.env.SHEET_ID;
   if (!sheetId) throw new Error("SHEET_ID manquant (variable d'environnement)");
 
-  const jwt = getJwtClient();
-  const doc = new GoogleSpreadsheet(sheetId, jwt);
-  await doc.loadInfo();
-  return doc;
+  if (
+    docCache &&
+    docCacheSheetId === sheetId &&
+    Date.now() - docCacheLoadedAt < DOC_CACHE_TTL_MS
+  ) {
+    return docCache;
+  }
+
+  if (docCacheInFlight && docCacheSheetId === sheetId) {
+    return await docCacheInFlight;
+  }
+
+  docCacheSheetId = sheetId;
+  docCacheInFlight = (async () => {
+    const jwt = getJwtClient();
+    const doc = new GoogleSpreadsheet(sheetId, jwt);
+    await withSheetsBackoff(() => doc.loadInfo());
+    docCache = doc;
+    docCacheLoadedAt = Date.now();
+    return doc;
+  })();
+
+  try {
+    return await docCacheInFlight;
+  } finally {
+    docCacheInFlight = null;
+  }
 }
 
 export async function getSheetByName(name) {
@@ -194,20 +339,32 @@ export async function addUser(joueursSheet, discordId, userName) {
 
   const rowByName = await findRowByNameWithoutId(joueursSheet, userName);
   if (rowByName) {
-    invalidateCache(joueursSheet);
-    await joueursSheet.loadCells(`F${rowByName}:F${rowByName}`);
+    const key = getCacheKey(joueursSheet);
+    const fullLoaded = isCacheValid(key) && cellCacheLoaded.get(key);
+    if (!fullLoaded) {
+      invalidateCache(joueursSheet);
+      await withSheetsBackoff(() => joueursSheet.loadCells(`F${rowByName}:F${rowByName}`));
+    }
+
     joueursSheet.getCell(rowByName - 1, COL_ID_DISCORD - 1).value = String(discordId);
-    await joueursSheet.saveUpdatedCells();
+    await withSheetsBackoff(() => joueursSheet.saveUpdatedCells());
+    touchCache(joueursSheet);
     return true;
   }
 
   const row = await findFirstEmptyRowInColumnF(joueursSheet);
-  if (row > joueursSheet.rowCount) {
-    await joueursSheet.resize({ rowCount: row });
+  const prevRowCount = joueursSheet.rowCount;
+  const resized = row > prevRowCount;
+  if (resized) {
+    await withSheetsBackoff(() => joueursSheet.resize({ rowCount: row }));
   }
 
-  invalidateCache(joueursSheet);
-  await joueursSheet.loadCells(`A${row}:H${row}`);
+  const key = getCacheKey(joueursSheet);
+  const fullLoaded = isCacheValid(key) && cellCacheLoaded.get(key);
+  if (!fullLoaded || resized) {
+    invalidateCache(joueursSheet);
+    await withSheetsBackoff(() => joueursSheet.loadCells(`A${row}:H${row}`));
+  }
 
   joueursSheet.getCell(row - 1, COL_NOM - 1).value = userName;
   joueursSheet.getCell(row - 1, COL_SOLDE - 1).value = "0 €";
@@ -216,7 +373,8 @@ export async function addUser(joueursSheet, discordId, userName) {
   joueursSheet.getCell(row - 1, COL_PARTICIPATIONS - 1).value = 0;
   joueursSheet.getCell(row - 1, COL_REGEAR - 1).value = 0;
 
-  await joueursSheet.saveUpdatedCells();
+  await withSheetsBackoff(() => joueursSheet.saveUpdatedCells());
+  touchCache(joueursSheet);
   return true;
 }
 
@@ -228,11 +386,47 @@ export async function updateUserName(joueursSheet, discordId, newName) {
   const currentName = String(joueursSheet.getCell(row - 1, COL_NOM - 1).value ?? "").trim();
   if (currentName === String(newName).trim()) return false;
 
-  invalidateCache(joueursSheet);
-  await joueursSheet.loadCells(`C${row}:C${row}`);
+  const key = getCacheKey(joueursSheet);
+  const fullLoaded = isCacheValid(key) && cellCacheLoaded.get(key);
+  if (!fullLoaded) {
+    invalidateCache(joueursSheet);
+    await withSheetsBackoff(() => joueursSheet.loadCells(`C${row}:C${row}`));
+  }
+
   joueursSheet.getCell(row - 1, COL_NOM - 1).value = newName;
-  await joueursSheet.saveUpdatedCells();
+  await withSheetsBackoff(() => joueursSheet.saveUpdatedCells());
+  touchCache(joueursSheet);
   return true;
+}
+
+function objectToLowerMap(obj) {
+  const m = new Map();
+  for (const [k, v] of Object.entries(obj ?? {})) m.set(String(k).toLowerCase(), v);
+  return m;
+}
+
+async function loadActivitiesObjectsCached(activitesSheet) {
+  const key = getCacheKey(activitesSheet);
+  const cached = activitiesCache.get(key);
+  if (cached && Date.now() < cached.expiresAt) return cached.items;
+
+  const inFlight = activitiesInFlight.get(key);
+  if (inFlight) return await inFlight;
+
+  const p = (async () => {
+    await withSheetsBackoff(() => activitesSheet.loadHeaderRow(3));
+    const rows = await withSheetsBackoff(() => activitesSheet.getRows());
+    const items = rows.map((r) => r.toObject());
+    activitiesCache.set(key, { expiresAt: Date.now() + ACTIVITIES_CACHE_TTL_MS, items });
+    return items;
+  })();
+
+  activitiesInFlight.set(key, p);
+  try {
+    return await p;
+  } finally {
+    activitiesInFlight.delete(key);
+  }
 }
 
 function readCellText(cell) {
@@ -298,14 +492,14 @@ export async function getColumnSum(joueursSheet, colIndex) {
 }
 
 export async function listActivities(activitesSheet, limit = 10) {
-  await activitesSheet.loadHeaderRow(3);
-  const rows = await activitesSheet.getRows();
+  const rows = await loadActivitiesObjectsCached(activitesSheet);
   const items = [];
-  for (const r of rows) {
-    const id = String(r.get("ID") ?? "").trim();
+  for (const obj of rows) {
+    const m = objectToLowerMap(obj);
+    const id = String(m.get("id") ?? "").trim();
     if (!id) continue;
-    const title = String(r.get("TITRE") ?? r.get("Titre") ?? r.get("NAME") ?? "").trim();
-    const date = String(r.get("DATE") ?? r.get("Date") ?? "").trim();
+    const title = String(m.get("titre") ?? m.get("title") ?? m.get("name") ?? "").trim();
+    const date = String(m.get("date") ?? "").trim();
     items.push({ id, title, date });
   }
   items.reverse();
@@ -313,14 +507,12 @@ export async function listActivities(activitesSheet, limit = 10) {
 }
 
 export async function getActivityById(activitesSheet, id) {
-  await activitesSheet.loadHeaderRow(3);
-  const rows = await activitesSheet.getRows();
+  const rows = await loadActivitiesObjectsCached(activitesSheet);
   const target = String(id);
-  for (const r of rows) {
-    const rid = String(r.get("ID") ?? "").trim();
+  for (const obj of rows) {
+    const m = objectToLowerMap(obj);
+    const rid = String(m.get("id") ?? "").trim();
     if (rid === target) {
-      const obj = {};
-      for (const k of Object.keys(r.toObject())) obj[k] = r.get(k);
       return obj;
     }
   }
