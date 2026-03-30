@@ -1,0 +1,18 @@
+# Node
+node_modules/
+
+# Env
+.env
+
+# Secrets (Google service account / keys)
+credentials*.json
+service_account*.json
+token*.json
+*.pem
+
+# Python
+.venv/
+__pycache__/
+
+# macOS
+.DS_Store

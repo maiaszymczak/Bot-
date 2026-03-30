@@ -22,11 +22,24 @@ Pour la sheet `JOUEURS`:
 ## Node.js (recommandé si ton exemple JS marche déjà)
 
 ```zsh
-cd /Users/maia/Desktop/bsg
+cd bsg
 npm install
 npm run check:gsheets
 npm start
 ```
+
+### Déploiement Wispbyte (GitHub)
+
+- `Git Repo Address`: l'URL du repo
+- `Install Branch`: `main`
+- `JS file`: `index.js`
+- Variables d'env à définir dans le panel:
+  - `DISCORD_TOKEN` (obligatoirel)
+  - `GUILD_ID` (obligatoire)
+  - `SHEET_ID` (obligatoire)
+  - Auth Google: mets `credentials.json` dans `bsg/credentials.json` **ou** définis `GOOGLE_SERVICE_ACCOUNT_FILE` vers ton JSON
+  - Optionnel: `BSG_MEMBER_ROLE_ID` (recommandé) ou `BSG_MEMBER_ROLE_NAME`
+  - Optionnel: `SHEET_HEADER_ROWS`, `AUTO_DELETE_SECONDS`
 
 Commandes (slash): `/register`, `/money`, `/top`, `/stats`, `/activity`, `/checkmembers`.
 
@@ -38,7 +51,7 @@ Messages non permanents:
 ## Python
 
 ```zsh
-cd /Users/maia/Desktop/bsg
+cd bsg
 /usr/bin/python3 check_gsheets.py
 /usr/bin/python3 bot.py
 ```

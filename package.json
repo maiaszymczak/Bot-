@@ -1,0 +1,16 @@
+{
+  "name": "bsg-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "check:gsheets": "node bsg/check_gsheets_js.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.4.5",
+    "google-auth-library": "^9.14.2",
+    "google-spreadsheet": "^4.1.2"
+  }
+}

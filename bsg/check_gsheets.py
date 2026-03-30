@@ -64,7 +64,7 @@ def main() -> int:
         print(
             "ERREUR: auth Google non configurée.\n\n"
             "Option 0 (comme ton bot JS):\n"
-            "  - Mets le fichier `credentials.json` (service account) dans /Users/maia/Desktop/bsg/\n\n"
+            "  - Mets le fichier `credentials.json` (service account) à côté de ce script: bsg/credentials.json\n\n"
             "Option A (recommandée): JSON service account\n"
             "  - Place le JSON sur disque et ajoute dans .env:\n"
             "    GOOGLE_SERVICE_ACCOUNT_FILE=/chemin/vers/service_account.json\n\n"

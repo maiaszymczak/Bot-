@@ -15,13 +15,42 @@ const SCOPES = [
   "https://www.googleapis.com/auth/drive",
 ];
 
-// Column mapping based on your sheet layout
-export const COL_NOM = 3; // C
-export const COL_SOLDE = 4; // D
-export const COL_CUMUL = 5; // E
-export const COL_ID_DISCORD = 6; // F
-export const COL_PARTICIPATIONS = 7; // G
-export const COL_REGEAR = 8; // H
+export const COL_NOM = 3;
+export const COL_SOLDE = 4;
+export const COL_CUMUL = 5;
+export const COL_ID_DISCORD = 6;
+export const COL_PARTICIPATIONS = 7;
+export const COL_REGEAR = 8;
+
+const CACHE_TTL_MS = 2 * 1000;
+const cellCacheExpiry = new Map();
+const cellCacheLoaded = new Map();
+
+function getCacheKey(sheet) {
+  return String(sheet.sheetId);
+}
+
+function isCacheValid(key) {
+  return Date.now() < (cellCacheExpiry.get(key) ?? 0);
+}
+
+function invalidateCache(sheet) {
+  const key = getCacheKey(sheet);
+  cellCacheExpiry.delete(key);
+  cellCacheLoaded.delete(key);
+}
+
+export function invalidateSheetCache(sheet) {
+  invalidateCache(sheet);
+}
+
+async function loadFullJoueursSheetCached(sheet) {
+  const key = getCacheKey(sheet);
+  if (isCacheValid(key)) return;
+  await sheet.loadCells("A:H");
+  cellCacheExpiry.set(key, Date.now() + CACHE_TTL_MS);
+  cellCacheLoaded.set(key, true);
+}
 
 function getHeaderRows() {
   const raw = process.env.SHEET_HEADER_ROWS;
@@ -65,7 +94,7 @@ export function getJwtClient() {
   const credPath = findCredentialsFile();
   if (!credPath) {
     throw new Error(
-      "Credentials introuvables. Mets `credentials.json` à la racine du projet (côté serveur aussi) ou définis GOOGLE_SERVICE_ACCOUNT_FILE."
+      "Credentials introuvables. Mets `credentials.json` à la racine du projet ou définis GOOGLE_SERVICE_ACCOUNT_FILE."
     );
   }
 
@@ -98,11 +127,14 @@ export async function getSheetByName(name) {
   return sheet;
 }
 
+async function loadFullJoueursSheet(joueursSheet) {
+  await loadFullJoueursSheetCached(joueursSheet);
+}
+
 export async function countRegisteredUsers(joueursSheet) {
-  const startRow = getHeaderRows() + 1;
-  await joueursSheet.loadCells(`F${startRow}:F${joueursSheet.rowCount}`);
+  await loadFullJoueursSheet(joueursSheet);
   const ids = new Set();
-  for (let row = startRow; row <= joueursSheet.rowCount; row++) {
+  for (let row = 1; row <= joueursSheet.rowCount; row++) {
     const cell = joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1);
     const v = String(cell.value ?? "").trim();
     if (v) ids.add(v);
@@ -111,8 +143,7 @@ export async function countRegisteredUsers(joueursSheet) {
 }
 
 export async function findUserRowIndexByDiscordId(joueursSheet, discordId) {
-  // Do not assume header row count; scan the full ID column.
-  await joueursSheet.loadCells(`F1:F${joueursSheet.rowCount}`);
+  await loadFullJoueursSheet(joueursSheet);
   const target = String(discordId);
   for (let row = 1; row <= joueursSheet.rowCount; row++) {
     const cell = joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1);
@@ -123,8 +154,8 @@ export async function findUserRowIndexByDiscordId(joueursSheet, discordId) {
 }
 
 async function findFirstEmptyRowInColumnF(joueursSheet) {
+  await loadFullJoueursSheet(joueursSheet);
   const startRow = getHeaderRows() + 1;
-  await joueursSheet.loadCells(`F${startRow}:F${joueursSheet.rowCount}`);
   for (let row = startRow; row <= joueursSheet.rowCount; row++) {
     const cell = joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1);
     const v = String(cell.value ?? "").trim();
@@ -133,14 +164,49 @@ async function findFirstEmptyRowInColumnF(joueursSheet) {
   return joueursSheet.rowCount + 1;
 }
 
+function normName(s) {
+  return String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function namesMatch(sheetName, discordName) {
+  const a = normName(sheetName);
+  const b = normName(discordName);
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+async function findRowByNameWithoutId(joueursSheet, userName) {
+  await loadFullJoueursSheet(joueursSheet);
+  const startRow = getHeaderRows() + 1;
+  for (let row = startRow; row <= joueursSheet.rowCount; row++) {
+    const idCell = joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1);
+    const idVal = String(idCell.value ?? "").trim();
+    if (idVal) continue;
+    const nameCell = joueursSheet.getCell(row - 1, COL_NOM - 1);
+    const nameVal = String(nameCell.value ?? "").trim();
+    if (nameVal && namesMatch(nameVal, userName)) return row;
+  }
+  return null;
+}
+
 export async function addUser(joueursSheet, discordId, userName) {
   const existing = await findUserRowIndexByDiscordId(joueursSheet, discordId);
   if (existing) return false;
+
+  const rowByName = await findRowByNameWithoutId(joueursSheet, userName);
+  if (rowByName) {
+    invalidateCache(joueursSheet);
+    await joueursSheet.loadCells(`F${rowByName}:F${rowByName}`);
+    joueursSheet.getCell(rowByName - 1, COL_ID_DISCORD - 1).value = String(discordId);
+    await joueursSheet.saveUpdatedCells();
+    return true;
+  }
 
   const row = await findFirstEmptyRowInColumnF(joueursSheet);
   if (row > joueursSheet.rowCount) {
     await joueursSheet.resize({ rowCount: row });
   }
+
+  invalidateCache(joueursSheet);
   await joueursSheet.loadCells(`A${row}:H${row}`);
 
   joueursSheet.getCell(row - 1, COL_NOM - 1).value = userName;
@@ -157,25 +223,49 @@ export async function addUser(joueursSheet, discordId, userName) {
 export async function updateUserName(joueursSheet, discordId, newName) {
   const row = await findUserRowIndexByDiscordId(joueursSheet, discordId);
   if (!row) return false;
+
+  await loadFullJoueursSheet(joueursSheet);
+  const currentName = String(joueursSheet.getCell(row - 1, COL_NOM - 1).value ?? "").trim();
+  if (currentName === String(newName).trim()) return false;
+
+  invalidateCache(joueursSheet);
   await joueursSheet.loadCells(`C${row}:C${row}`);
   joueursSheet.getCell(row - 1, COL_NOM - 1).value = newName;
   await joueursSheet.saveUpdatedCells();
   return true;
 }
 
+function readCellText(cell) {
+  if (cell.formattedValue != null) return String(cell.formattedValue).trim();
+  return String(cell.value ?? "").trim();
+}
+
 export async function getBalance(joueursSheet, discordId) {
   const row = await findUserRowIndexByDiscordId(joueursSheet, discordId);
   if (!row) return null;
-  await joueursSheet.loadCells(`C${row}:E${row}`);
+  await loadFullJoueursSheet(joueursSheet);
   const name = String(joueursSheet.getCell(row - 1, COL_NOM - 1).value ?? "").trim();
-  const balance = String(joueursSheet.getCell(row - 1, COL_SOLDE - 1).value ?? "").trim();
-  const cumulative = String(joueursSheet.getCell(row - 1, COL_CUMUL - 1).value ?? "").trim();
+  const balance = readCellText(joueursSheet.getCell(row - 1, COL_SOLDE - 1));
+  const cumulative = readCellText(joueursSheet.getCell(row - 1, COL_CUMUL - 1));
   return { name, balance, cumulative };
+}
+
+export async function listRegisteredDiscordUsers(joueursSheet) {
+  await loadFullJoueursSheet(joueursSheet);
+  const startRow = getHeaderRows() + 1;
+  const out = [];
+  for (let row = startRow; row <= joueursSheet.rowCount; row++) {
+    const id = String(joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1).value ?? "").trim();
+    if (!id) continue;
+    const name = String(joueursSheet.getCell(row - 1, COL_NOM - 1).value ?? "").trim();
+    out.push({ discordId: id, sheetName: name });
+  }
+  return out;
 }
 
 export async function getTopPlayers(joueursSheet, sortColIndex, topN = 10) {
   const startRow = getHeaderRows() + 1;
-  await joueursSheet.loadCells(`C${startRow}:H${joueursSheet.rowCount}`);
+  await loadFullJoueursSheet(joueursSheet);
 
   const rows = [];
   for (let row = startRow; row <= joueursSheet.rowCount; row++) {
@@ -197,7 +287,7 @@ export async function getTopPlayers(joueursSheet, sortColIndex, topN = 10) {
 
 export async function getColumnSum(joueursSheet, colIndex) {
   const startRow = getHeaderRows() + 1;
-  await joueursSheet.loadCells(`A${startRow}:H${joueursSheet.rowCount}`);
+  await loadFullJoueursSheet(joueursSheet);
   let sum = 0;
   for (let row = startRow; row <= joueursSheet.rowCount; row++) {
     const raw = joueursSheet.getCell(row - 1, colIndex - 1).value;
@@ -208,7 +298,6 @@ export async function getColumnSum(joueursSheet, colIndex) {
 }
 
 export async function listActivities(activitesSheet, limit = 10) {
-  // Headers are on row 3 in your sheet (Python logic). Tell google-spreadsheet explicitly.
   await activitesSheet.loadHeaderRow(3);
   const rows = await activitesSheet.getRows();
   const items = [];
@@ -219,7 +308,6 @@ export async function listActivities(activitesSheet, limit = 10) {
     const date = String(r.get("DATE") ?? r.get("Date") ?? "").trim();
     items.push({ id, title, date });
   }
-  // newest first if there is a date; otherwise keep order
   items.reverse();
   return items.slice(0, limit);
 }
@@ -231,7 +319,6 @@ export async function getActivityById(activitesSheet, id) {
   for (const r of rows) {
     const rid = String(r.get("ID") ?? "").trim();
     if (rid === target) {
-      // Return a plain object of all known columns
       const obj = {};
       for (const k of Object.keys(r.toObject())) obj[k] = r.get(k);
       return obj;

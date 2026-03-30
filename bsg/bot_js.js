@@ -1,10 +1,15 @@
 import "dotenv/config";
+import http from "http";
 import {
   Client,
   GatewayIntentBits,
   Partials,
   EmbedBuilder,
   ApplicationCommandOptionType,
+  MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } from "discord.js";
 
 import {
@@ -19,6 +24,8 @@ import {
   getSheetByName,
   getTopPlayers,
   getActivityById,
+  invalidateSheetCache,
+  listRegisteredDiscordUsers,
   listActivities,
   updateUserName,
 } from "./sheets_js.js";
@@ -30,130 +37,26 @@ if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN manquant (variable d'environn
 if (!GUILD_ID) throw new Error("GUILD_ID manquant (variable d'environnement)");
 
 const ROLE_ID = process.env.BSG_MEMBER_ROLE_ID || null;
-const ROLE_NAME = process.env.BSG_MEMBER_ROLE_NAME || "bsg membre";
+const ROLE_NAME = process.env.BSG_MEMBER_ROLE_NAME || "Membre";
 
-const AUTO_DELETE_SECONDS_RAW = process.env.AUTO_DELETE_SECONDS;
-const AUTO_DELETE_SECONDS = (() => {
-  const n = AUTO_DELETE_SECONDS_RAW == null ? 300 : Number(AUTO_DELETE_SECONDS_RAW);
-  if (!Number.isFinite(n)) return 300;
-  return Math.min(3600, Math.max(30, Math.trunc(n)));
-})();
-const AUTO_DELETE_MS = AUTO_DELETE_SECONDS * 1000;
-
-function formatRemaining(ms) {
-  const total = Math.max(0, Math.ceil(ms / 1000));
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-function withCountdownLine(baseContent, remainingStr) {
-  const countdown = `⏳ Suppression dans ${remainingStr}`;
-  const base = String(baseContent ?? "").trim();
-  if (!base) return countdown;
-  const combined = `${base}\n\n${countdown}`;
-  return combined.length <= 2000 ? combined : (base.slice(0, 2000 - countdown.length - 2) + `\n\n${countdown}`);
-}
-
-function decoratePayloadWithCountdown(payload, remainingStr) {
-  const countdown = `⏳ Suppression dans ${remainingStr}`;
-  const hasEmbeds = Array.isArray(payload?.embeds) && payload.embeds.length > 0;
-  const baseContent = payload?.content ?? "";
-
-  // Prefer putting countdown in the embed footer when there is no content.
-  if (hasEmbeds && !String(baseContent ?? "").trim()) {
-    const embeds = payload.embeds.map((e) => {
-      const eb = EmbedBuilder.from(e);
-      const current = eb.data?.footer?.text ? String(eb.data.footer.text) : "";
-      const next = current ? `${current} • ${countdown}` : countdown;
-      eb.setFooter({ text: next.slice(0, 2048) });
-      return eb;
-    });
-    return { ...payload, embeds };
-  }
-
-  // Otherwise, show countdown in message content.
-  return { ...payload, content: withCountdownLine(baseContent, remainingStr) };
-}
-
-async function replyAutoDelete(interaction, payload) {
-  // Ensure the interaction is acknowledged quickly, then post a PUBLIC message in the channel.
-  // This avoids any accidental ephemeral behavior and guarantees the message is visible to everyone.
-  if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply({ ephemeral: true });
-  }
-
-  const channel = interaction.channel;
-  if (!channel || !channel.isTextBased()) {
-    throw new Error("Impossible d'envoyer un message: channel indisponible");
-  }
-
-  const initialRemaining = formatRemaining(AUTO_DELETE_MS);
-  const message = await channel.send(decoratePayloadWithCountdown(payload, initialRemaining));
-
-  // Replace the ephemeral ACK with something minimal (optional) then delete it.
+async function replyEphemeral(interaction, payload) {
   try {
-    await interaction.deleteReply();
+    if (interaction.replied) {
+      await interaction.followUp({ flags: MessageFlags.Ephemeral, ...payload });
+    } else {
+      await interaction.editReply({ ...payload });
+    }
   } catch {
-    // ignore
-  }
-
-  const start = Date.now();
-  const tick = async () => {
-    const elapsed = Date.now() - start;
-    const remaining = AUTO_DELETE_MS - elapsed;
-    if (remaining <= 0) {
-      clearInterval(interval);
-      try {
-        await message.delete();
-      } catch {
-        // ignore
-      }
-      return;
-    }
     try {
-      await message.edit(decoratePayloadWithCountdown(payload, formatRemaining(remaining)));
+      await interaction.followUp({ flags: MessageFlags.Ephemeral, ...payload });
     } catch {
-      // If we can't edit anymore (permissions/deleted), stop.
-      clearInterval(interval);
+      // impossible de répondre
     }
-  };
-
-  const interval = setInterval(tick, 10_000);
-  return message;
+  }
 }
 
-async function followUpAutoDelete(interaction, payload) {
-  // When we already replied/deferred, just post another PUBLIC message.
-  const channel = interaction.channel;
-  if (!channel || !channel.isTextBased()) {
-    throw new Error("Impossible d'envoyer un message: channel indisponible");
-  }
-
-  const initialRemaining = formatRemaining(AUTO_DELETE_MS);
-  const msg = await channel.send(decoratePayloadWithCountdown(payload, initialRemaining));
-
-  const start = Date.now();
-  const tick = async () => {
-    const elapsed = Date.now() - start;
-    const remaining = AUTO_DELETE_MS - elapsed;
-    if (remaining <= 0) {
-      clearInterval(interval);
-      try {
-        await msg.delete();
-      } catch {
-        // ignore
-      }
-      return;
-    }
-    try {
-      await msg.edit(decoratePayloadWithCountdown(payload, formatRemaining(remaining)));
-    } catch {
-      clearInterval(interval);
-    }
-  };
-  const interval = setInterval(tick, 10_000);
-  return msg;
+async function followUpEphemeral(interaction, payload) {
+  await interaction.followUp({ flags: MessageFlags.Ephemeral, ...payload });
 }
 
 function norm(s) {
@@ -183,8 +86,45 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
+client.on("error", (err) => {
+  console.error("Discord client error:", err);
+});
+client.on("shardError", (err) => {
+  console.error("Discord shard error:", err);
+});
+
 let joueursSheet;
 let activitesSheet;
+let sheetsLoadedAt = 0;
+const SHEETS_META_TTL_MS = 5 * 60 * 1000;
+
+const NAME_FIX_TTL_MS = 10 * 60 * 1000;
+const pendingNameFixes = new Map();
+
+function cleanupPendingFixes() {
+  const now = Date.now();
+  for (const [token, obj] of pendingNameFixes.entries()) {
+    if (!obj?.createdAt || now - obj.createdAt > NAME_FIX_TTL_MS) pendingNameFixes.delete(token);
+  }
+}
+
+function makeToken() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function normNameSimple(s) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function namesRoughlyMatch(a, b) {
+  const x = normNameSimple(a);
+  const y = normNameSimple(b);
+  if (!x || !y) return false;
+  return x === y || x.includes(y) || y.includes(x);
+}
 
 function formatTopLines(rows) {
   return rows
@@ -245,9 +185,10 @@ function renderActivitiesTable(items) {
 }
 
 async function ensureSheetsLoaded() {
-  if (joueursSheet && activitesSheet) return;
+  if (joueursSheet && activitesSheet && Date.now() - sheetsLoadedAt < SHEETS_META_TTL_MS) return;
   joueursSheet = await getSheetByName("JOUEURS");
   activitesSheet = await getSheetByName("ACTIVITES");
+  sheetsLoadedAt = Date.now();
 }
 
 async function getGuildAndRole() {
@@ -289,7 +230,15 @@ async function registerGuildCommands() {
   await guild.commands.set([
     {
       name: "register",
-      description: "Enregistre ton compte (ID Discord) dans la sheet",
+      description: "Enregistre un membre dans la sheet (toi ou quelqu'un d'autre)",
+      options: [
+        {
+          name: "membre",
+          description: "Membre à enregistrer (laisser vide pour toi-même)",
+          type: ApplicationCommandOptionType.User,
+          required: false,
+        },
+      ],
     },
     {
       name: "money",
@@ -361,6 +310,10 @@ async function registerGuildCommands() {
       name: "checkmembers",
       description: "Compare Discord vs Sheet (membres enregistrés)",
     },
+    {
+      name: "checknames",
+      description: "Vérifie les noms (sheet vs Discord) et propose une correction",
+    },
   ]);
 }
 
@@ -375,18 +328,17 @@ async function startupSyncRoleMembers() {
   const roleMembers = role.members;
   console.log(`Sync: ${roleMembers.size} membres avec rôle '${role.name}'`);
 
+  // Précharge les données une seule fois pour tout le sync (évite 115 appels API)
+  invalidateSheetCache(joueursSheet);
+
   let added = 0;
-  let updated = 0;
   for (const member of roleMembers.values()) {
     const display = member.displayName;
-    // addUser is idempotent; update name too
     if (await addUser(joueursSheet, member.id, display)) added++;
-    if (await updateUserName(joueursSheet, member.id, display)) updated++;
   }
 
-  // Ensure cache isn't the only source; keep members fetched to avoid partial role.members
   void members;
-  console.log(`Sync terminé: ajoutés=${added}, noms_maj=${updated}`);
+  console.log(`Sync terminé: ajoutés=${added}`);
 }
 
 client.once("ready", async () => {
@@ -412,7 +364,6 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   try {
     await ensureSheetsLoaded();
 
-    // Role gained
     const oldHas = memberHasRole(oldMember);
     const newHas = memberHasRole(newMember);
     if (!oldHas && newHas) {
@@ -421,7 +372,6 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
       if (added) console.log(`Ajout sheet: ${display} (${newMember.id})`);
     }
 
-    // Nickname/display name changed
     const oldName = oldMember.displayName;
     const newName = newMember.displayName;
     if (oldName !== newName) {
@@ -434,46 +384,120 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  cleanupPendingFixes();
   if (interaction.guildId !== GUILD_ID) return;
+
+  if (interaction.isButton()) {
+    const id = String(interaction.customId ?? "");
+    if (!id.startsWith("checknames:")) return;
+
+    if (!interaction.deferred && !interaction.replied) {
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } catch {
+        return;
+      }
+    }
+
+    const [, action, token] = id.split(":");
+    const pending = token ? pendingNameFixes.get(token) : null;
+    if (!pending) {
+      await replyEphemeral(interaction, { content: "⏳ Proposition expirée. Relance `/checknames`." });
+      return;
+    }
+    if (pending.userId !== interaction.user.id) {
+      await replyEphemeral(interaction, { content: "❌ Seule la personne qui a lancé `/checknames` peut valider." });
+      return;
+    }
+
+    if (action === "cancel") {
+      pendingNameFixes.delete(token);
+      await replyEphemeral(interaction, { content: "✅ Correction annulée." });
+      return;
+    }
+
+    if (action !== "apply") {
+      await replyEphemeral(interaction, { content: "Action inconnue." });
+      return;
+    }
+
+    pendingNameFixes.delete(token);
+    try {
+      await ensureSheetsLoaded();
+      invalidateSheetCache(joueursSheet);
+
+      let updated = 0;
+      for (const ch of pending.changes) {
+        if (!ch?.discordId || !ch?.to) continue;
+        const ok = await updateUserName(joueursSheet, ch.discordId, ch.to);
+        if (ok) updated++;
+      }
+      await replyEphemeral(interaction, { content: `✅ Noms corrigés: ${updated}/${pending.changes.length}` });
+    } catch (e) {
+      const msg = e?.message ?? String(e);
+      await replyEphemeral(interaction, { content: `Erreur: ${msg}` });
+    }
+    return;
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+
+  if (!interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } catch (e) {
+      // Une autre instance a déjà pris cet événement → on abandonne
+      console.warn(`deferReply échoué pour ${interaction.commandName} (${interaction.id}): ${e?.message}`);
+      return;
+    }
+  }
 
   try {
     await ensureSheetsLoaded();
 
     if (interaction.commandName === "register") {
+      const targetUser = interaction.options.getUser("membre") ?? interaction.user;
       const { guild } = await getGuildAndRole();
-      const member = await guild.members.fetch(interaction.user.id);
+      const member = await guild.members.fetch(targetUser.id);
       const display = member.displayName;
-      const added = await addUser(joueursSheet, interaction.user.id, display);
-      await updateUserName(joueursSheet, interaction.user.id, display);
-      await replyAutoDelete(interaction, {
+      const added = await addUser(joueursSheet, targetUser.id, display);
+      await replyEphemeral(interaction, {
         content: added
           ? `✅ Enregistré dans la sheet: ${display}`
-          : `✅ Déjà enregistré. Nom mis à jour: ${display}`,
+          : `ℹ️ ${display} est déjà enregistré(e) dans la sheet.`,
       });
       return;
     }
 
     if (interaction.commandName === "money") {
       const user = interaction.options.getUser("membre") ?? interaction.user;
+      const memberDisplayName = await (async () => {
+        try {
+          const guild = interaction.guild;
+          if (!guild) return null;
+          const member = await guild.members.fetch(user.id);
+          return member?.displayName ? String(member.displayName) : null;
+        } catch {
+          return null;
+        }
+      })();
       let bal = await getBalance(joueursSheet, user.id);
       if (!bal) {
-        if (!bal) {
-          const hint =
-            user.id === interaction.user.id
-              ? "\n➡️  Fais `/register` pour t'ajouter automatiquement."
-              : "";
-          await replyAutoDelete(interaction, {
-            content: `❌ Pas trouvé dans la sheet: ${user.username}${hint}`,
-          });
-          return;
-        }
+        const hint =
+          user.id === interaction.user.id
+            ? "\n➡️  Fais `/register` pour t'ajouter automatiquement."
+            : "";
+        await replyEphemeral(interaction, {
+          content: `❌ Pas trouvé dans la sheet: ${user.username}${hint}`,
+        });
+        return;
       }
 
       const guildName = interaction.guild?.name ?? "Guilde";
-      const aventurier = (bal.name || user.username || "-").trim();
-      const soldeRaw = (bal.balance || "0 €").trim();
-      const cumulRaw = (bal.cumulative || "0 €").trim();
+      const aventurier = (memberDisplayName || bal.name || user.username || "-").trim();
+      const stripEuro = (s) => (s || "0").trim().replace(/\s*€\s*$/, "").trim();
+      const soldeRaw = stripEuro(bal.balance);
+      const cumulRaw = stripEuro(bal.cumulative);
       const embed = new EmbedBuilder()
         .setTitle(`🏦 Bank - ${guildName} -`)
         .setDescription("Voici le contenu de ton coffre de guilde")
@@ -486,7 +510,7 @@ client.on("interactionCreate", async (interaction) => {
           text: "Veuillez contacter un membre du staff pour récupérer vos gains",
         });
 
-      await replyAutoDelete(interaction, { embeds: [embed] });
+      await replyEphemeral(interaction, { embeds: [embed] });
       return;
     }
 
@@ -516,13 +540,13 @@ client.on("interactionCreate", async (interaction) => {
         .setTitle(title)
         .setDescription(items.length ? renderTopTable(items, { isMoney }) : "Aucune donnée")
         .setFooter({ text: "Source: Google Sheets" });
-      await replyAutoDelete(interaction, { embeds: [embed] });
+      await replyEphemeral(interaction, { embeds: [embed] });
       return;
     }
 
     if (interaction.commandName === "stats") {
       const sum = await getColumnSum(joueursSheet, COL_PARTICIPATIONS);
-      await replyAutoDelete(interaction, { content: `Participations totales (guilde): ${sum}` });
+      await replyEphemeral(interaction, { content: `Participations totales (guilde): ${sum}` });
       return;
     }
 
@@ -533,20 +557,20 @@ client.on("interactionCreate", async (interaction) => {
         const limit = Number.isFinite(n) && n > 0 ? Math.min(20, Math.trunc(n)) : 10;
         const items = await listActivities(activitesSheet, limit);
         if (!items.length) {
-          await replyAutoDelete(interaction, { content: "Aucune activité trouvée." });
+          await replyEphemeral(interaction, { content: "Aucune activité trouvée." });
           return;
         }
         const embed = new EmbedBuilder()
           .setTitle("Activités (récentes)")
           .setDescription(renderActivitiesTable(items));
-        await replyAutoDelete(interaction, { embeds: [embed] });
+        await replyEphemeral(interaction, { embeds: [embed] });
         return;
       }
       if (sub === "detail") {
         const id = interaction.options.getString("id", true);
         const obj = await getActivityById(activitesSheet, id);
         if (!obj) {
-          await replyAutoDelete(interaction, { content: `Activité introuvable: ${id}` });
+          await replyEphemeral(interaction, { content: `Activité introuvable: ${id}` });
           return;
         }
         const keys = Object.keys(obj);
@@ -558,7 +582,7 @@ client.on("interactionCreate", async (interaction) => {
           if (!s) continue;
           embed.addFields({ name: k, value: s.slice(0, 1024) });
         }
-        await replyAutoDelete(interaction, { embeds: [embed] });
+        await replyEphemeral(interaction, { embeds: [embed] });
         return;
       }
     }
@@ -566,26 +590,119 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.commandName === "checkmembers") {
       const { guild, role } = await getGuildAndRole();
       if (!role) {
-        await replyAutoDelete(interaction, { content: `Rôle introuvable: ${ROLE_NAME}` });
+        await replyEphemeral(interaction, { content: `Rôle introuvable: ${ROLE_NAME}` });
         return;
       }
       await guild.members.fetch();
       const discordCount = role.members.size;
       const sheetCount = await countRegisteredUsers(joueursSheet);
-      await replyAutoDelete(interaction, {
+      await replyEphemeral(interaction, {
         content: `Discord (rôle '${role.name}'): ${discordCount} | Sheet (IDs enregistrés): ${sheetCount}`,
+      });
+      return;
+    }
+
+    if (interaction.commandName === "checknames") {
+      const { guild } = await getGuildAndRole();
+      // On ne fetch pas tous les membres: uniquement ceux présents dans la sheet.
+      const regs = await listRegisteredDiscordUsers(joueursSheet);
+      if (!regs.length) {
+        await replyEphemeral(interaction, { content: "Aucun ID Discord trouvé dans la sheet." });
+        return;
+      }
+
+      const changes = [];
+      let missing = 0;
+
+      for (const r of regs) {
+        const discordId = String(r.discordId);
+        let member;
+        try {
+          member = await guild.members.fetch(discordId);
+        } catch {
+          member = null;
+        }
+        if (!member) {
+          missing++;
+          continue;
+        }
+
+        const discordName = String(member.displayName ?? member.user?.username ?? "").trim();
+        const sheetName = String(r.sheetName ?? "").trim();
+        if (!sheetName) {
+          changes.push({ discordId, from: sheetName, to: discordName });
+          continue;
+        }
+        if (namesRoughlyMatch(sheetName, discordName)) continue;
+        changes.push({ discordId, from: sheetName, to: discordName });
+      }
+
+      if (!changes.length) {
+        const extra = missing ? ` (IDs introuvables sur Discord: ${missing})` : "";
+        await replyEphemeral(interaction, { content: `✅ Aucun nom à corriger${extra}.` });
+        return;
+      }
+
+      const token = makeToken();
+      pendingNameFixes.set(token, {
+        createdAt: Date.now(),
+        userId: interaction.user.id,
+        changes,
+      });
+
+      const shown = changes.slice(0, 12);
+      const lines = shown
+        .map((c) => `- <@${c.discordId}>: sheet="${String(c.from).slice(0, 40)}" → discord="${String(c.to).slice(0, 40)}"`)
+        .join("\n");
+      const more = changes.length > shown.length ? `\n… +${changes.length - shown.length} autres` : "";
+      const info = `🔎 Propositions de correction: ${changes.length}${missing ? ` | IDs Discord introuvables: ${missing}` : ""}`;
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`checknames:apply:${token}`)
+          .setLabel("Appliquer")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`checknames:cancel:${token}`)
+          .setLabel("Annuler")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      await replyEphemeral(interaction, {
+        content: `${info}\n\n${lines}${more}\n\nValider ?` ,
+        components: [row],
       });
       return;
     }
   } catch (e) {
     console.error("interaction error:", e);
     const msg = e?.message ?? String(e);
-    if (interaction.deferred || interaction.replied) {
-      await followUpAutoDelete(interaction, { content: `Erreur: ${msg}` });
-    } else {
-      await replyAutoDelete(interaction, { content: `Erreur: ${msg}` });
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await followUpEphemeral(interaction, { content: `Erreur: ${msg}` });
+      } else {
+        await replyEphemeral(interaction, { content: `Erreur: ${msg}` });
+      }
+    } catch (replyErr) {
+      console.error("Failed to send error response:", replyErr);
     }
   }
+});
+
+const PORT = process.env.PORT || 8080;
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("OK");
+});
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.warn(`Port ${PORT} déjà utilisé, health check ignoré.`);
+  } else {
+    console.error("Health check server error:", err);
+  }
+});
+server.listen(PORT, () => {
+  console.log(`Health check server listening on port ${PORT}`);
 });
 
 await client.login(DISCORD_TOKEN);

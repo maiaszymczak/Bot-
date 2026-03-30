@@ -13,7 +13,7 @@ try {
   console.error("ERREUR:", e?.message ?? e);
   console.error(
     "\nFix rapide (comme ton bot JS):\n" +
-      "- Copie ton fichier service account JSON ici: /Users/maia/Desktop/bsg/credentials.json\n" +
+      "- Copie ton fichier service account JSON ici: bsg/credentials.json\n" +
       "  (ou définis GOOGLE_SERVICE_ACCOUNT_FILE=/chemin/vers/credentials.json dans .env)\n"
   );
   process.exitCode = 1;
