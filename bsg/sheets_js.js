@@ -129,6 +129,32 @@ function getCacheKey(sheet) {
   return String(sheet.sheetId);
 }
 
+function colToA1(colIndex1Based) {
+  let n = Number(colIndex1Based);
+  if (!Number.isFinite(n) || n < 1) return "A";
+  n = Math.trunc(n);
+  let s = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function normHeader(s) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function baseKey(key) {
+  const raw = String(key ?? "");
+  const idx = raw.indexOf("__");
+  return idx === -1 ? raw : raw.slice(0, idx);
+}
+
 function isCacheValid(key) {
   return Date.now() < (cellCacheExpiry.get(key) ?? 0);
 }
@@ -414,9 +440,51 @@ async function loadActivitiesObjectsCached(activitesSheet) {
   if (inFlight) return await inFlight;
 
   const p = (async () => {
-    await withSheetsBackoff(() => activitesSheet.loadHeaderRow(3));
-    const rows = await withSheetsBackoff(() => activitesSheet.getRows());
-    const items = rows.map((r) => r.toObject());
+    // On évite loadHeaderRow/getRows car ça exige des headers uniques.
+    const headerRow = 3;
+    const firstDataRow = headerRow + 1;
+
+    const maxCols = Math.max(1, Math.trunc(activitesSheet.columnCount ?? 1));
+    const maxRows = Math.max(firstDataRow, Math.trunc(activitesSheet.rowCount ?? firstDataRow));
+    const lastColA1 = colToA1(maxCols);
+
+    // Charge le header + toutes les lignes de données (cache TTL pour ne pas spammer).
+    const range = `A${headerRow}:${lastColA1}${maxRows}`;
+    await withSheetsBackoff(() => activitesSheet.loadCells(range));
+
+    const headerCounts = new Map();
+    const headerKeys = [];
+    for (let c = 1; c <= maxCols; c++) {
+      const cell = activitesSheet.getCell(headerRow - 1, c - 1);
+      const raw = String(cell?.value ?? cell?.formattedValue ?? "").trim();
+      if (!raw) {
+        headerKeys.push(null);
+        continue;
+      }
+      const base = raw;
+      const n = (headerCounts.get(base) ?? 0) + 1;
+      headerCounts.set(base, n);
+      const keyName = n === 1 ? base : `${base}__${n}`;
+      headerKeys.push(keyName);
+    }
+
+    const items = [];
+    for (let r = firstDataRow; r <= maxRows; r++) {
+      const obj = {};
+      let hasAny = false;
+      for (let c = 1; c <= maxCols; c++) {
+        const k = headerKeys[c - 1];
+        if (!k) continue;
+        const cell = activitesSheet.getCell(r - 1, c - 1);
+        const v = cell?.formattedValue ?? cell?.value;
+        const s = v == null ? "" : String(v).trim();
+        if (s) hasAny = true;
+        obj[k] = v;
+      }
+      if (!hasAny) continue;
+      items.push(obj);
+    }
+
     activitiesCache.set(key, { expiresAt: Date.now() + ACTIVITIES_CACHE_TTL_MS, items });
     return items;
   })();
@@ -496,10 +564,22 @@ export async function listActivities(activitesSheet, limit = 10) {
   const items = [];
   for (const obj of rows) {
     const m = objectToLowerMap(obj);
-    const id = String(m.get("id") ?? "").trim();
+
+    // Support headers dupliqués: on compare la base du header (avant __2, __3...)
+    const findByBase = (wanted) => {
+      const w = normHeader(wanted);
+      for (const [k, v] of m.entries()) {
+        if (normHeader(baseKey(k)) === w) return v;
+      }
+      return null;
+    };
+
+    const id = String(findByBase("id") ?? "").trim();
     if (!id) continue;
-    const title = String(m.get("titre") ?? m.get("title") ?? m.get("name") ?? "").trim();
-    const date = String(m.get("date") ?? "").trim();
+    const title = String(
+      findByBase("titre") ?? findByBase("title") ?? findByBase("name") ?? ""
+    ).trim();
+    const date = String(findByBase("date") ?? "").trim();
     items.push({ id, title, date });
   }
   items.reverse();
@@ -511,7 +591,13 @@ export async function getActivityById(activitesSheet, id) {
   const target = String(id);
   for (const obj of rows) {
     const m = objectToLowerMap(obj);
-    const rid = String(m.get("id") ?? "").trim();
+    let rid = "";
+    for (const [k, v] of m.entries()) {
+      if (normHeader(baseKey(k)) === "id") {
+        rid = String(v ?? "").trim();
+        break;
+      }
+    }
     if (rid === target) {
       return obj;
     }
