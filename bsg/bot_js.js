@@ -7,6 +7,7 @@ import {
   EmbedBuilder,
   ApplicationCommandOptionType,
   MessageFlags,
+  PermissionsBitField,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -38,6 +39,13 @@ if (!GUILD_ID) throw new Error("GUILD_ID manquant (variable d'environnement)");
 
 const ROLE_ID = process.env.BSG_MEMBER_ROLE_ID || null;
 const ROLE_NAME = process.env.BSG_MEMBER_ROLE_NAME || "Membre";
+
+const STAFF_ROLE_IDS = new Set(
+  String(process.env.BSG_STAFF_ROLE_IDS ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
 
 async function replyEphemeral(interaction, payload) {
   try {
@@ -124,6 +132,33 @@ function namesRoughlyMatch(a, b) {
   const y = normNameSimple(b);
   if (!x || !y) return false;
   return x === y || x.includes(y) || y.includes(x);
+}
+
+function isStaffInteraction(interaction) {
+  const perms = interaction.memberPermissions;
+  if (
+    perms &&
+    (perms.has(PermissionsBitField.Flags.Administrator) ||
+      perms.has(PermissionsBitField.Flags.ManageGuild))
+  ) {
+    return true;
+  }
+
+  if (!STAFF_ROLE_IDS.size) return false;
+
+  const roles = interaction.member?.roles;
+  // GuildMember
+  if (roles?.cache?.has) {
+    for (const id of STAFF_ROLE_IDS) {
+      if (roles.cache.has(id)) return true;
+    }
+    return false;
+  }
+  // APIInteractionGuildMember
+  if (Array.isArray(roles)) {
+    return roles.some((id) => STAFF_ROLE_IDS.has(String(id)));
+  }
+  return false;
 }
 
 function formatTopLines(rows) {
@@ -391,6 +426,19 @@ client.on("interactionCreate", async (interaction) => {
     const id = String(interaction.customId ?? "");
     if (!id.startsWith("checknames:")) return;
 
+    if (!isStaffInteraction(interaction)) {
+      // Best-effort ACK, then refuse.
+      try {
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        }
+      } catch {
+        // ignore
+      }
+      await replyEphemeral(interaction, { content: "❌ Réservé aux admins/staff." });
+      return;
+    }
+
     if (!interaction.deferred && !interaction.replied) {
       try {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -603,6 +651,10 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.commandName === "checknames") {
+      if (!isStaffInteraction(interaction)) {
+        await replyEphemeral(interaction, { content: "❌ Réservé aux admins/staff." });
+        return;
+      }
       const { guild } = await getGuildAndRole();
       // On ne fetch pas tous les membres: uniquement ceux présents dans la sheet.
       const regs = await listRegisteredDiscordUsers(joueursSheet);
