@@ -20,6 +20,7 @@ import {
   COL_REGEAR,
   COL_SOLDE,
   addUser,
+  bulkUpdateUserNames,
   bulkUpsertUsers,
   countRegisteredUsers,
   getBalance,
@@ -589,13 +590,20 @@ client.on("interactionCreate", async (interaction) => {
       await ensureSheetsLoaded();
       invalidateSheetCache(joueursSheet);
 
-      let updated = 0;
-      for (const ch of pending.changes) {
-        if (!ch?.discordId || !ch?.to) continue;
-        const ok = await updateUserName(joueursSheet, ch.discordId, ch.to);
-        if (ok) updated++;
-      }
-      await replyEphemeral(interaction, { content: `✅ Noms corrigés: ${updated}/${pending.changes.length}` });
+      const updates = (pending.changes ?? [])
+        .map((ch) => {
+          const discordId = String(ch?.discordId ?? "").trim();
+          const userName = String(ch?.to ?? "").trim();
+          if (!discordId || !userName) return null;
+          return { discordId, userName };
+        })
+        .filter(Boolean);
+
+      const stats = await bulkUpdateUserNames(joueursSheet, updates);
+      const noteMissing = stats.missing ? ` | IDs manquants dans la sheet: ${stats.missing}` : "";
+      await replyEphemeral(interaction, {
+        content: `✅ Noms corrigés: ${stats.renamed}/${updates.length}${noteMissing}`,
+      });
     } catch (e) {
       const msg = e?.message ?? String(e);
       await replyEphemeral(interaction, { content: `Erreur: ${msg}` });
