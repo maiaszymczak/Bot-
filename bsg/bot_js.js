@@ -403,6 +403,10 @@ async function registerGuildCommands() {
       name: "checknames",
       description: "Vérifie les noms (sheet vs Discord) et propose une correction",
     },
+    {
+      name: "syncmembers",
+      description: "(Staff) Scanne le rôle Membres et remplit nom + ID dans la sheet",
+    },
   ]);
 }
 
@@ -848,6 +852,42 @@ client.on("interactionCreate", async (interaction) => {
       await replyEphemeral(interaction, {
         content: `${info}\n\n${lines}${more}\n\nValider ?` ,
         components: [row],
+      });
+      return;
+    }
+
+    if (interaction.commandName === "syncmembers") {
+      if (!isStaffInteraction(interaction)) {
+        await replyEphemeral(interaction, { content: "❌ Réservé aux admins/staff." });
+        return;
+      }
+
+      const { guild, role } = await getGuildAndRole();
+      if (!role) {
+        await replyEphemeral(interaction, { content: `Rôle introuvable: ${ROLE_NAME}` });
+        return;
+      }
+
+      // On évite l'opcode 8: listing REST.
+      const apiMembers = await listGuildMembersViaRest(guild.id);
+      const roleId = role.id;
+      const roleMembers = apiMembers.filter((m) => Array.isArray(m?.roles) && m.roles.includes(roleId));
+
+      await ensureSheetsLoaded();
+      invalidateSheetCache(joueursSheet);
+
+      let added = 0;
+      let processed = 0;
+      for (const m of roleMembers) {
+        const id = m?.user?.id;
+        if (!id) continue;
+        processed++;
+        const display = getApiMemberDisplayName(m);
+        if (await addUser(joueursSheet, String(id), display)) added++;
+      }
+
+      await replyEphemeral(interaction, {
+        content: `✅ Sync terminé (rôle '${role.name}'): ${added} ajout(s)/ID rempli(s) sur ${processed} membres scannés.`,
       });
       return;
     }
