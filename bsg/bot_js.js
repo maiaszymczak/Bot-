@@ -19,7 +19,6 @@ import {
   COL_PARTICIPATIONS,
   COL_REGEAR,
   COL_SOLDE,
-  addUser,
   bulkUpsertUsers,
   countRegisteredUsers,
   getBalance,
@@ -29,7 +28,6 @@ import {
   getActivityById,
   invalidateSheetCache,
   listActivities,
-  updateUserName,
 } from "./sheets_js.js";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -417,12 +415,11 @@ async function startupSyncRoleMembers() {
     console.log(`Sync (gateway): ${roleMembers.size} membres avec rôle '${role.name}'`);
 
     invalidateSheetCache(joueursSheet);
-    let added = 0;
-    for (const member of roleMembers.values()) {
-      const display = member.displayName;
-      if (await addUser(joueursSheet, member.id, display)) added++;
-    }
-    console.log(`Sync terminé: ajoutés=${added}`);
+    const users = [...roleMembers.values()].map((m) => ({ discordId: String(m.id), userName: String(m.displayName ?? "").trim() }));
+    const stats = await bulkUpsertUsers(joueursSheet, users, { updateNames: true, fillDefaultsForNewRows: true });
+    console.log(
+      `Sync terminé: scannés=${stats.processed} ids=${stats.filledIds} nomsMaj=${stats.renamed} nouvellesLignes=${stats.created}`
+    );
     return;
   }
 
@@ -442,14 +439,17 @@ async function startupSyncRoleMembers() {
       console.log(`Sync (rest): ${roleMembers.length} membres avec rôle '${role.name}'`);
 
       invalidateSheetCache(joueursSheet);
-      let added = 0;
-      for (const m of roleMembers) {
-        const id = m?.user?.id;
-        if (!id) continue;
-        const display = getApiMemberDisplayName(m);
-        if (await addUser(joueursSheet, String(id), display)) added++;
-      }
-      console.log(`Sync terminé: ajoutés=${added}`);
+      const users = roleMembers
+        .map((m) => {
+          const id = m?.user?.id;
+          if (!id) return null;
+          return { discordId: String(id), userName: getApiMemberDisplayName(m) };
+        })
+        .filter(Boolean);
+      const stats = await bulkUpsertUsers(joueursSheet, users, { updateNames: true, fillDefaultsForNewRows: true });
+      console.log(
+        `Sync terminé: scannés=${stats.processed} ids=${stats.filledIds} nomsMaj=${stats.renamed} nouvellesLignes=${stats.created}`
+      );
       return;
     }
   }
@@ -463,12 +463,11 @@ async function startupSyncRoleMembers() {
     );
 
     invalidateSheetCache(joueursSheet);
-    let added = 0;
-    for (const member of roleMembers.values()) {
-      const display = member.displayName;
-      if (await addUser(joueursSheet, member.id, display)) added++;
-    }
-    console.log(`Sync terminé: ajoutés=${added}`);
+    const users = [...roleMembers.values()].map((m) => ({ discordId: String(m.id), userName: String(m.displayName ?? "").trim() }));
+    const stats = await bulkUpsertUsers(joueursSheet, users, { updateNames: true, fillDefaultsForNewRows: true });
+    console.log(
+      `Sync terminé: scannés=${stats.processed} ids=${stats.filledIds} nomsMaj=${stats.renamed} nouvellesLignes=${stats.created}`
+    );
   }
 }
 
@@ -499,15 +498,25 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
     const newHas = memberHasRole(newMember);
     if (!oldHas && newHas) {
       const display = newMember.displayName;
-      const added = await addUser(joueursSheet, newMember.id, display);
-      if (added) console.log(`Ajout sheet: ${display} (${newMember.id})`);
+      invalidateSheetCache(joueursSheet);
+      const stats = await bulkUpsertUsers(
+        joueursSheet,
+        [{ discordId: String(newMember.id), userName: String(display ?? "").trim() }],
+        { updateNames: true, fillDefaultsForNewRows: true }
+      );
+      if (stats.filledIds || stats.created) console.log(`Ajout sheet: ${display} (${newMember.id})`);
     }
 
     const oldName = oldMember.displayName;
     const newName = newMember.displayName;
     if (oldName !== newName) {
-      const updated = await updateUserName(joueursSheet, newMember.id, newName);
-      if (updated) console.log(`Nom maj sheet: ${newMember.id} -> ${newName}`);
+      invalidateSheetCache(joueursSheet);
+      const stats = await bulkUpsertUsers(
+        joueursSheet,
+        [{ discordId: String(newMember.id), userName: String(newName ?? "").trim() }],
+        { updateNames: true, fillDefaultsForNewRows: false }
+      );
+      if (stats.renamed) console.log(`Nom maj sheet: ${newMember.id} -> ${newName}`);
     }
   } catch (e) {
     console.error("guildMemberUpdate error:", e);
@@ -605,7 +614,13 @@ client.on("interactionCreate", async (interaction) => {
       const { guild } = await getGuildAndRole();
       const member = await guild.members.fetch(targetUser.id);
       const display = member.displayName;
-      const added = await addUser(joueursSheet, targetUser.id, display);
+      invalidateSheetCache(joueursSheet);
+      const stats = await bulkUpsertUsers(
+        joueursSheet,
+        [{ discordId: String(targetUser.id), userName: String(display ?? "").trim() }],
+        { updateNames: true, fillDefaultsForNewRows: true }
+      );
+      const added = Boolean(stats.filledIds || stats.created);
       await replyEphemeral(interaction, {
         content: added
           ? `✅ Enregistré dans la sheet: ${display}`
