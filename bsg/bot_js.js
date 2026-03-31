@@ -20,6 +20,7 @@ import {
   COL_REGEAR,
   COL_SOLDE,
   addUser,
+  bulkUpsertUsers,
   countRegisteredUsers,
   getBalance,
   getColumnSum,
@@ -876,18 +877,21 @@ client.on("interactionCreate", async (interaction) => {
       await ensureSheetsLoaded();
       invalidateSheetCache(joueursSheet);
 
-      let added = 0;
-      let processed = 0;
-      for (const m of roleMembers) {
-        const id = m?.user?.id;
-        if (!id) continue;
-        processed++;
-        const display = getApiMemberDisplayName(m);
-        if (await addUser(joueursSheet, String(id), display)) added++;
-      }
+      const users = roleMembers
+        .map((m) => {
+          const id = m?.user?.id;
+          if (!id) return null;
+          return { discordId: String(id), userName: getApiMemberDisplayName(m) };
+        })
+        .filter(Boolean);
+
+      const stats = await bulkUpsertUsers(joueursSheet, users, {
+        updateNames: false,
+        fillDefaultsForNewRows: true,
+      });
 
       await replyEphemeral(interaction, {
-        content: `✅ Sync terminé (rôle '${role.name}'): ${added} ajout(s)/ID rempli(s) sur ${processed} membres scannés.`,
+        content: `✅ Sync terminé (rôle '${role.name}'): scannés=${stats.processed} | IDs remplis/ajoutés=${stats.filledIds} | nouvelles lignes=${stats.created}`,
       });
       return;
     }

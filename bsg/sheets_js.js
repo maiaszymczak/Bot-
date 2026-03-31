@@ -425,6 +425,162 @@ export async function updateUserName(joueursSheet, discordId, newName) {
   return true;
 }
 
+function normNameSimple(s) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function namesRoughlyMatchSimple(a, b) {
+  const x = normNameSimple(a);
+  const y = normNameSimple(b);
+  if (!x || !y) return false;
+  return x === y || x.includes(y) || y.includes(x);
+}
+
+export async function bulkUpsertUsers(
+  joueursSheet,
+  users,
+  { updateNames = true, fillDefaultsForNewRows = true } = {}
+) {
+  const list = Array.isArray(users) ? users : [];
+  const startRow = getHeaderRows() + 1;
+
+  // Toujours charger une vue cohérente une seule fois.
+  await loadFullJoueursSheet(joueursSheet);
+
+  const idToRow = new Map();
+  const nameNoIdRows = []; // { row, name }
+  const freeRows = []; // rows with empty ID (can be reused)
+
+  for (let row = startRow; row <= joueursSheet.rowCount; row++) {
+    const idCell = joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1);
+    const id = String(idCell.value ?? "").trim();
+    const nameCell = joueursSheet.getCell(row - 1, COL_NOM - 1);
+    const name = String(nameCell.value ?? "").trim();
+
+    if (id) {
+      if (!idToRow.has(id)) idToRow.set(id, row);
+      continue;
+    }
+
+    freeRows.push(row);
+    if (name) nameNoIdRows.push({ row, name });
+  }
+
+  const initialRowCount = joueursSheet.rowCount;
+  let nextAppendRow = initialRowCount + 1;
+  let requiredRowCount = initialRowCount;
+
+  const newRows = []; // { row, discordId, userName }
+
+  let processed = 0;
+  let filledIds = 0;
+  let renamed = 0;
+  let created = 0;
+
+  const allocateRow = () => {
+    if (freeRows.length) return freeRows.shift();
+    const row = nextAppendRow++;
+    newRows.push({ row, discordId: null, userName: null });
+    requiredRowCount = Math.max(requiredRowCount, row);
+    return row;
+  };
+
+  for (const u of list) {
+    const discordId = String(u?.discordId ?? "").trim();
+    const userName = String(u?.userName ?? "").trim();
+    if (!discordId) continue;
+    processed++;
+
+    const existingRow = idToRow.get(discordId) ?? null;
+    if (existingRow) {
+      if (updateNames && userName) {
+        const cell = joueursSheet.getCell(existingRow - 1, COL_NOM - 1);
+        const cur = String(cell.value ?? "").trim();
+        if (cur && cur !== userName) {
+          cell.value = userName;
+          renamed++;
+        }
+      }
+      continue;
+    }
+
+    // Essaye de matcher une ligne existante avec nom mais sans ID.
+    let matched = null;
+    if (userName) {
+      for (let i = 0; i < nameNoIdRows.length; i++) {
+        const it = nameNoIdRows[i];
+        if (!it) continue;
+        if (namesRoughlyMatchSimple(it.name, userName)) {
+          matched = it;
+          nameNoIdRows.splice(i, 1);
+          break;
+        }
+      }
+    }
+
+    const row = matched?.row ?? allocateRow();
+    idToRow.set(discordId, row);
+
+    if (row <= initialRowCount) {
+      // Ligne existante: on peut écrire tout de suite.
+      joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1).value = discordId;
+      filledIds++;
+
+      const nameCell = joueursSheet.getCell(row - 1, COL_NOM - 1);
+      const curName = String(nameCell.value ?? "").trim();
+      if (userName && !curName) nameCell.value = userName;
+      continue;
+    }
+
+    // Nouvelle ligne: on applique après resize/loadCells.
+    const slot = newRows.find((x) => x.row === row);
+    if (slot) {
+      slot.discordId = discordId;
+      slot.userName = userName;
+    } else {
+      newRows.push({ row, discordId, userName });
+    }
+  }
+
+  if (requiredRowCount > initialRowCount) {
+    const oldCount = initialRowCount;
+    await withSheetsBackoff(() => joueursSheet.resize({ rowCount: requiredRowCount }));
+
+    // Après resize, charger les cellules des nouvelles lignes.
+    const lastColA1 = colToA1(8);
+    await withSheetsBackoff(() =>
+      joueursSheet.loadCells(`A${oldCount + 1}:${lastColA1}${requiredRowCount}`)
+    );
+
+    for (const nr of newRows) {
+      if (!nr?.discordId) continue;
+      const row = nr.row;
+      joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1).value = String(nr.discordId);
+      filledIds++;
+
+      if (nr.userName) {
+        joueursSheet.getCell(row - 1, COL_NOM - 1).value = String(nr.userName);
+      }
+
+      if (fillDefaultsForNewRows) {
+        joueursSheet.getCell(row - 1, COL_SOLDE - 1).value = "0 €";
+        joueursSheet.getCell(row - 1, COL_CUMUL - 1).value = "0 €";
+        joueursSheet.getCell(row - 1, COL_PARTICIPATIONS - 1).value = 0;
+        joueursSheet.getCell(row - 1, COL_REGEAR - 1).value = 0;
+      }
+      created++;
+    }
+  }
+
+  await withSheetsBackoff(() => joueursSheet.saveUpdatedCells());
+  touchCache(joueursSheet);
+
+  return { processed, filledIds, renamed, created };
+}
+
 function objectToLowerMap(obj) {
   const m = new Map();
   for (const [k, v] of Object.entries(obj ?? {})) m.set(String(k).toLowerCase(), v);
