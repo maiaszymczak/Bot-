@@ -30,10 +30,6 @@ Toutes les commandes sont des **slash commands** (tape `/` puis le nom).
 
 ## Commandes staff
 
-- `/checknames` — Compare **noms Discord** vs **noms dans la sheet** (par ID Discord) et propose des corrections.
-  - Le bot affiche une proposition puis tu valides avec **Appliquer** ou **Annuler**.
-  - Accès: admins / manage serveur, ou rôles listés dans `BSG_STAFF_ROLE_IDS`.
-
 - `/syncmembers` — Scanne tous les membres ayant le rôle **Membres** et remplit la sheet avec **Nom + ID Discord**.
   - Utile pour compléter les IDs manquants dans la sheet.
   - Accès: admins / manage serveur, ou rôles listés dans `BSG_STAFF_ROLE_IDS`.

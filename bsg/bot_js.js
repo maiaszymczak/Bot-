@@ -20,7 +20,6 @@ import {
   COL_REGEAR,
   COL_SOLDE,
   addUser,
-  bulkUpdateUserNames,
   bulkUpsertUsers,
   countRegisteredUsers,
   getBalance,
@@ -29,7 +28,6 @@ import {
   getTopPlayers,
   getActivityById,
   invalidateSheetCache,
-  listRegisteredDiscordUsers,
   listActivities,
   updateUserName,
 } from "./sheets_js.js";
@@ -162,32 +160,18 @@ let activitesSheet;
 let sheetsLoadedAt = 0;
 const SHEETS_META_TTL_MS = 5 * 60 * 1000;
 
-const NAME_FIX_TTL_MS = 10 * 60 * 1000;
-const pendingNameFixes = new Map();
+const SYNC_MEMBERS_TTL_MS = 10 * 60 * 1000;
+const pendingSyncMembers = new Map();
 
-function cleanupPendingFixes() {
+function cleanupPendingSyncMembers() {
   const now = Date.now();
-  for (const [token, obj] of pendingNameFixes.entries()) {
-    if (!obj?.createdAt || now - obj.createdAt > NAME_FIX_TTL_MS) pendingNameFixes.delete(token);
+  for (const [token, obj] of pendingSyncMembers.entries()) {
+    if (!obj?.createdAt || now - obj.createdAt > SYNC_MEMBERS_TTL_MS) pendingSyncMembers.delete(token);
   }
 }
 
 function makeToken() {
   return Math.random().toString(36).slice(2, 10);
-}
-
-function normNameSimple(s) {
-  return String(s ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
-
-function namesRoughlyMatch(a, b) {
-  const x = normNameSimple(a);
-  const y = normNameSimple(b);
-  if (!x || !y) return false;
-  return x === y || x.includes(y) || y.includes(x);
 }
 
 function isStaffInteraction(interaction) {
@@ -402,10 +386,6 @@ async function registerGuildCommands() {
       description: "Compare Discord vs Sheet (membres enregistrés)",
     },
     {
-      name: "checknames",
-      description: "Vérifie les noms (sheet vs Discord) et propose une correction",
-    },
-    {
       name: "syncmembers",
       description: "(Staff) Scanne le rôle Membres et remplit nom + ID dans la sheet",
     },
@@ -535,15 +515,14 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  cleanupPendingFixes();
+  cleanupPendingSyncMembers();
   if (interaction.guildId !== GUILD_ID) return;
 
   if (interaction.isButton()) {
     const id = String(interaction.customId ?? "");
-    if (!id.startsWith("checknames:")) return;
+    if (!id.startsWith("syncmembers:")) return;
 
     if (!isStaffInteraction(interaction)) {
-      // Best-effort ACK, then refuse.
       try {
         if (!interaction.deferred && !interaction.replied) {
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -564,19 +543,19 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const [, action, token] = id.split(":");
-    const pending = token ? pendingNameFixes.get(token) : null;
+    const pending = token ? pendingSyncMembers.get(token) : null;
     if (!pending) {
-      await replyEphemeral(interaction, { content: "⏳ Proposition expirée. Relance `/checknames`." });
+      await replyEphemeral(interaction, { content: "⏳ Proposition expirée. Relance `/syncmembers`." });
       return;
     }
     if (pending.userId !== interaction.user.id) {
-      await replyEphemeral(interaction, { content: "❌ Seule la personne qui a lancé `/checknames` peut valider." });
+      await replyEphemeral(interaction, { content: "❌ Seule la personne qui a lancé `/syncmembers` peut valider." });
       return;
     }
 
     if (action === "cancel") {
-      pendingNameFixes.delete(token);
-      await replyEphemeral(interaction, { content: "✅ Correction annulée." });
+      pendingSyncMembers.delete(token);
+      await replyEphemeral(interaction, { content: "✅ Sync annulé." });
       return;
     }
 
@@ -585,24 +564,19 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    pendingNameFixes.delete(token);
+    pendingSyncMembers.delete(token);
     try {
       await ensureSheetsLoaded();
       invalidateSheetCache(joueursSheet);
 
-      const updates = (pending.changes ?? [])
-        .map((ch) => {
-          const discordId = String(ch?.discordId ?? "").trim();
-          const userName = String(ch?.to ?? "").trim();
-          if (!discordId || !userName) return null;
-          return { discordId, userName };
-        })
-        .filter(Boolean);
+      const users = Array.isArray(pending.users) ? pending.users : [];
+      const stats = await bulkUpsertUsers(joueursSheet, users, {
+        updateNames: true,
+        fillDefaultsForNewRows: true,
+      });
 
-      const stats = await bulkUpdateUserNames(joueursSheet, updates);
-      const noteMissing = stats.missing ? ` | IDs manquants dans la sheet: ${stats.missing}` : "";
       await replyEphemeral(interaction, {
-        content: `✅ Noms corrigés: ${stats.renamed}/${updates.length}${noteMissing}`,
+        content: `✅ Sync terminé (rôle '${pending.roleName}'): scannés=${stats.processed} | IDs remplis/ajoutés=${stats.filledIds} | noms MAJ=${stats.renamed} | nouvelles lignes=${stats.created}`,
       });
     } catch (e) {
       const msg = e?.message ?? String(e);
@@ -788,83 +762,6 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    if (interaction.commandName === "checknames") {
-      if (!isStaffInteraction(interaction)) {
-        await replyEphemeral(interaction, { content: "❌ Réservé aux admins/staff." });
-        return;
-      }
-      const { guild } = await getGuildAndRole();
-      // On ne fetch pas tous les membres: uniquement ceux présents dans la sheet.
-      const regs = await listRegisteredDiscordUsers(joueursSheet);
-      if (!regs.length) {
-        await replyEphemeral(interaction, { content: "Aucun ID Discord trouvé dans la sheet." });
-        return;
-      }
-
-      const changes = [];
-      let missing = 0;
-
-      for (const r of regs) {
-        const discordId = String(r.discordId);
-        let member;
-        try {
-          member = await guild.members.fetch(discordId);
-        } catch {
-          member = null;
-        }
-        if (!member) {
-          missing++;
-          continue;
-        }
-
-        const discordName = String(member.displayName ?? member.user?.username ?? "").trim();
-        const sheetName = String(r.sheetName ?? "").trim();
-        if (!sheetName) {
-          changes.push({ discordId, from: sheetName, to: discordName });
-          continue;
-        }
-        if (namesRoughlyMatch(sheetName, discordName)) continue;
-        changes.push({ discordId, from: sheetName, to: discordName });
-      }
-
-      if (!changes.length) {
-        const extra = missing ? ` (IDs introuvables sur Discord: ${missing})` : "";
-        await replyEphemeral(interaction, { content: `✅ Aucun nom à corriger${extra}.` });
-        return;
-      }
-
-      const token = makeToken();
-      pendingNameFixes.set(token, {
-        createdAt: Date.now(),
-        userId: interaction.user.id,
-        changes,
-      });
-
-      const shown = changes.slice(0, 12);
-      const lines = shown
-        .map((c) => `- <@${c.discordId}>: sheet="${String(c.from).slice(0, 40)}" → discord="${String(c.to).slice(0, 40)}"`)
-        .join("\n");
-      const more = changes.length > shown.length ? `\n… +${changes.length - shown.length} autres` : "";
-      const info = `🔎 Propositions de correction: ${changes.length}${missing ? ` | IDs Discord introuvables: ${missing}` : ""}`;
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`checknames:apply:${token}`)
-          .setLabel("Appliquer")
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`checknames:cancel:${token}`)
-          .setLabel("Annuler")
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      await replyEphemeral(interaction, {
-        content: `${info}\n\n${lines}${more}\n\nValider ?` ,
-        components: [row],
-      });
-      return;
-    }
-
     if (interaction.commandName === "syncmembers") {
       if (!isStaffInteraction(interaction)) {
         await replyEphemeral(interaction, { content: "❌ Réservé aux admins/staff." });
@@ -882,6 +779,14 @@ client.on("interactionCreate", async (interaction) => {
       const roleId = role.id;
       const roleMembers = apiMembers.filter((m) => Array.isArray(m?.roles) && m.roles.includes(roleId));
 
+      if (!roleMembers.length) {
+        await replyEphemeral(interaction, {
+          content: `⚠️ Aucun membre trouvé avec le rôle '${role.name}'. Vérifie ` +
+            "`BSG_MEMBER_ROLE_ID`/`BSG_MEMBER_ROLE_NAME` (et que le bot a accès au serveur).",
+        });
+        return;
+      }
+
       await ensureSheetsLoaded();
       invalidateSheetCache(joueursSheet);
 
@@ -893,13 +798,28 @@ client.on("interactionCreate", async (interaction) => {
         })
         .filter(Boolean);
 
-      const stats = await bulkUpsertUsers(joueursSheet, users, {
-        updateNames: true,
-        fillDefaultsForNewRows: true,
+      const token = makeToken();
+      pendingSyncMembers.set(token, {
+        createdAt: Date.now(),
+        userId: interaction.user.id,
+        roleName: role.name,
+        users,
       });
 
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`syncmembers:apply:${token}`)
+          .setLabel("Appliquer")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`syncmembers:cancel:${token}`)
+          .setLabel("Annuler")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
       await replyEphemeral(interaction, {
-        content: `✅ Sync terminé (rôle '${role.name}'): scannés=${stats.processed} | IDs remplis/ajoutés=${stats.filledIds} | noms MAJ=${stats.renamed} | nouvelles lignes=${stats.created}`,
+        content: `🔎 Sync proposé (rôle '${role.name}'): scannés=${users.length}\n\nValider ?`,
+        components: [row],
       });
       return;
     }

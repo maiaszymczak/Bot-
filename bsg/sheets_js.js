@@ -425,50 +425,6 @@ export async function updateUserName(joueursSheet, discordId, newName) {
   return true;
 }
 
-export async function bulkUpdateUserNames(joueursSheet, updates) {
-  const list = Array.isArray(updates) ? updates : [];
-  const startRow = getHeaderRows() + 1;
-
-  await loadFullJoueursSheet(joueursSheet);
-
-  const idToRow = new Map();
-  for (let row = startRow; row <= joueursSheet.rowCount; row++) {
-    const id = String(joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1).value ?? "").trim();
-    if (id && !idToRow.has(id)) idToRow.set(id, row);
-  }
-
-  let processed = 0;
-  let renamed = 0;
-  let missing = 0;
-
-  for (const u of list) {
-    const discordId = String(u?.discordId ?? "").trim();
-    const newName = String(u?.userName ?? "").trim();
-    if (!discordId || !newName) continue;
-    processed++;
-
-    const row = idToRow.get(discordId);
-    if (!row) {
-      missing++;
-      continue;
-    }
-
-    const cell = joueursSheet.getCell(row - 1, COL_NOM - 1);
-    const cur = String(cell.value ?? "").trim();
-    if (cur !== newName) {
-      cell.value = newName;
-      renamed++;
-    }
-  }
-
-  if (renamed) {
-    await withSheetsBackoff(() => joueursSheet.saveUpdatedCells());
-    touchCache(joueursSheet);
-  }
-
-  return { processed, renamed, missing };
-}
-
 function normNameSimple(s) {
   return String(s ?? "")
     .trim()
@@ -543,7 +499,7 @@ export async function bulkUpsertUsers(
       if (updateNames && userName) {
         const cell = joueursSheet.getCell(existingRow - 1, COL_NOM - 1);
         const cur = String(cell.value ?? "").trim();
-        if (cur && cur !== userName) {
+        if (cur !== userName) {
           cell.value = userName;
           renamed++;
         }
