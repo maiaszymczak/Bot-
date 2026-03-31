@@ -894,12 +894,12 @@ client.on("interactionCreate", async (interaction) => {
         .filter(Boolean);
 
       const stats = await bulkUpsertUsers(joueursSheet, users, {
-        updateNames: false,
+        updateNames: true,
         fillDefaultsForNewRows: true,
       });
 
       await replyEphemeral(interaction, {
-        content: `✅ Sync terminé (rôle '${role.name}'): scannés=${stats.processed} | IDs remplis/ajoutés=${stats.filledIds} | nouvelles lignes=${stats.created}`,
+        content: `✅ Sync terminé (rôle '${role.name}'): scannés=${stats.processed} | IDs remplis/ajoutés=${stats.filledIds} | noms MAJ=${stats.renamed} | nouvelles lignes=${stats.created}`,
       });
       return;
     }
