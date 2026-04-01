@@ -605,9 +605,9 @@ function objectToLowerMap(obj) {
   return m;
 }
 
-async function loadActivitiesObjectsCached(activitesSheet, { full = false } = {}) {
+async function loadActivitiesObjectsCached(activitesSheet, { mode = "tail" } = {}) {
   const key = getCacheKey(activitesSheet);
-  const cacheKey = `${key}:${full ? "full" : "tail"}`;
+  const cacheKey = `${key}:activities:${String(mode)}`;
   const cached = activitiesCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) return cached.items;
 
@@ -624,16 +624,26 @@ async function loadActivitiesObjectsCached(activitesSheet, { full = false } = {}
     const maxRows = sheetRows;
     const lastColA1 = colToA1(maxCols);
 
-    // Charge uniquement le header + une fenêtre de lignes récentes par défaut.
-    // En cas de besoin (detail ID ancien), `getActivityById` peut demander un full scan.
+    // Charge uniquement le header + une fenêtre de lignes (tail/head) par défaut.
     const scanRows = getActivitiesScanRows();
-    const startDataRow = full
-      ? firstDataRow
-      : Math.max(firstDataRow, maxRows - scanRows + 1);
+    let startDataRow = firstDataRow;
+    let endDataRow = maxRows;
+    const m = String(mode ?? "tail").toLowerCase();
+    if (m === "tail") {
+      startDataRow = Math.max(firstDataRow, maxRows - scanRows + 1);
+      endDataRow = maxRows;
+    } else if (m === "head") {
+      startDataRow = firstDataRow;
+      endDataRow = Math.min(maxRows, firstDataRow + scanRows - 1);
+    } else {
+      // full
+      startDataRow = firstDataRow;
+      endDataRow = maxRows;
+    }
 
     await withSheetsBackoff(() => activitesSheet.loadCells(`A${headerRow}:${lastColA1}${headerRow}`));
-    if (startDataRow <= maxRows) {
-      await withSheetsBackoff(() => activitesSheet.loadCells(`A${startDataRow}:${lastColA1}${maxRows}`));
+    if (startDataRow <= endDataRow) {
+      await withSheetsBackoff(() => activitesSheet.loadCells(`A${startDataRow}:${lastColA1}${endDataRow}`));
     }
 
     const headerCounts = new Map();
@@ -653,7 +663,7 @@ async function loadActivitiesObjectsCached(activitesSheet, { full = false } = {}
     }
 
     const items = [];
-    for (let r = startDataRow; r <= maxRows; r++) {
+    for (let r = startDataRow; r <= endDataRow; r++) {
       const obj = {};
       let hasAny = false;
       for (let c = 1; c <= maxCols; c++) {
@@ -744,7 +754,10 @@ export async function getColumnSum(joueursSheet, colIndex) {
 }
 
 export async function listActivities(activitesSheet, limit = 10) {
-  const rows = await loadActivitiesObjectsCached(activitesSheet, { full: false });
+  // Par défaut on scanne la fin (dernières activités). Si la sheet a été agrandie
+  // et contient beaucoup de lignes vides en bas, on fallback sur un scan du haut.
+  let rows = await loadActivitiesObjectsCached(activitesSheet, { mode: "tail" });
+  if (!rows.length) rows = await loadActivitiesObjectsCached(activitesSheet, { mode: "head" });
   const items = [];
   for (const obj of rows) {
     const m = objectToLowerMap(obj);
@@ -771,8 +784,8 @@ export async function listActivities(activitesSheet, limit = 10) {
 }
 
 export async function getActivityById(activitesSheet, id) {
-  const tryFind = async (full) => {
-    const rows = await loadActivitiesObjectsCached(activitesSheet, { full });
+  const tryFind = async (mode) => {
+    const rows = await loadActivitiesObjectsCached(activitesSheet, { mode });
     const target = String(id);
     for (const obj of rows) {
       const m = objectToLowerMap(obj);
@@ -788,14 +801,17 @@ export async function getActivityById(activitesSheet, id) {
     return null;
   };
 
-  const hit = await tryFind(false);
+  const hit = await tryFind("tail");
   if (hit) return hit;
+
+  const hit2 = await tryFind("head");
+  if (hit2) return hit2;
 
   // Full scan (optionnel) si la sheet n'est pas gigantesque.
   const maxRows = getActivitiesFullScanMaxRows();
   const rowCount = Math.trunc(activitesSheet.rowCount ?? 0);
   if (rowCount > 0 && rowCount <= maxRows) {
-    return await tryFind(true);
+    return await tryFind("full");
   }
 
   return null;
