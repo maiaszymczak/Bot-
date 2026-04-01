@@ -57,6 +57,24 @@ function getActivitiesCacheTtlMs() {
   return 60 * 1000;
 }
 
+function getActivitiesHeaderRow() {
+  const raw = process.env.SHEET_ACTIVITIES_HEADER_ROW;
+  const n = raw == null ? 3 : Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 3;
+}
+
+function getActivitiesScanRows() {
+  const raw = process.env.SHEET_ACTIVITIES_SCAN_ROWS;
+  const n = raw == null ? 400 : Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 400;
+}
+
+function getActivitiesFullScanMaxRows() {
+  const raw = process.env.SHEET_ACTIVITIES_FULL_SCAN_MAX_ROWS;
+  const n = raw == null ? 2000 : Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 2000;
+}
+
 const CACHE_TTL_MS = getCacheTtlMs();
 const DOC_CACHE_TTL_MS = getDocCacheTtlMs();
 const ACTIVITIES_CACHE_TTL_MS = getActivitiesCacheTtlMs();
@@ -587,26 +605,36 @@ function objectToLowerMap(obj) {
   return m;
 }
 
-async function loadActivitiesObjectsCached(activitesSheet) {
+async function loadActivitiesObjectsCached(activitesSheet, { full = false } = {}) {
   const key = getCacheKey(activitesSheet);
-  const cached = activitiesCache.get(key);
+  const cacheKey = `${key}:${full ? "full" : "tail"}`;
+  const cached = activitiesCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) return cached.items;
 
-  const inFlight = activitiesInFlight.get(key);
+  const inFlight = activitiesInFlight.get(cacheKey);
   if (inFlight) return await inFlight;
 
   const p = (async () => {
     // On évite loadHeaderRow/getRows car ça exige des headers uniques.
-    const headerRow = 3;
+    const headerRow = getActivitiesHeaderRow();
     const firstDataRow = headerRow + 1;
 
     const maxCols = Math.max(1, Math.trunc(activitesSheet.columnCount ?? 1));
-    const maxRows = Math.max(firstDataRow, Math.trunc(activitesSheet.rowCount ?? firstDataRow));
+    const sheetRows = Math.max(firstDataRow, Math.trunc(activitesSheet.rowCount ?? firstDataRow));
+    const maxRows = sheetRows;
     const lastColA1 = colToA1(maxCols);
 
-    // Charge le header + toutes les lignes de données (cache TTL pour ne pas spammer).
-    const range = `A${headerRow}:${lastColA1}${maxRows}`;
-    await withSheetsBackoff(() => activitesSheet.loadCells(range));
+    // Charge uniquement le header + une fenêtre de lignes récentes par défaut.
+    // En cas de besoin (detail ID ancien), `getActivityById` peut demander un full scan.
+    const scanRows = getActivitiesScanRows();
+    const startDataRow = full
+      ? firstDataRow
+      : Math.max(firstDataRow, maxRows - scanRows + 1);
+
+    await withSheetsBackoff(() => activitesSheet.loadCells(`A${headerRow}:${lastColA1}${headerRow}`));
+    if (startDataRow <= maxRows) {
+      await withSheetsBackoff(() => activitesSheet.loadCells(`A${startDataRow}:${lastColA1}${maxRows}`));
+    }
 
     const headerCounts = new Map();
     const headerKeys = [];
@@ -625,7 +653,7 @@ async function loadActivitiesObjectsCached(activitesSheet) {
     }
 
     const items = [];
-    for (let r = firstDataRow; r <= maxRows; r++) {
+    for (let r = startDataRow; r <= maxRows; r++) {
       const obj = {};
       let hasAny = false;
       for (let c = 1; c <= maxCols; c++) {
@@ -641,15 +669,15 @@ async function loadActivitiesObjectsCached(activitesSheet) {
       items.push(obj);
     }
 
-    activitiesCache.set(key, { expiresAt: Date.now() + ACTIVITIES_CACHE_TTL_MS, items });
+    activitiesCache.set(cacheKey, { expiresAt: Date.now() + ACTIVITIES_CACHE_TTL_MS, items });
     return items;
   })();
 
-  activitiesInFlight.set(key, p);
+  activitiesInFlight.set(cacheKey, p);
   try {
     return await p;
   } finally {
-    activitiesInFlight.delete(key);
+    activitiesInFlight.delete(cacheKey);
   }
 }
 
@@ -716,7 +744,7 @@ export async function getColumnSum(joueursSheet, colIndex) {
 }
 
 export async function listActivities(activitesSheet, limit = 10) {
-  const rows = await loadActivitiesObjectsCached(activitesSheet);
+  const rows = await loadActivitiesObjectsCached(activitesSheet, { full: false });
   const items = [];
   for (const obj of rows) {
     const m = objectToLowerMap(obj);
@@ -743,20 +771,32 @@ export async function listActivities(activitesSheet, limit = 10) {
 }
 
 export async function getActivityById(activitesSheet, id) {
-  const rows = await loadActivitiesObjectsCached(activitesSheet);
-  const target = String(id);
-  for (const obj of rows) {
-    const m = objectToLowerMap(obj);
-    let rid = "";
-    for (const [k, v] of m.entries()) {
-      if (normHeader(baseKey(k)) === "id") {
-        rid = String(v ?? "").trim();
-        break;
+  const tryFind = async (full) => {
+    const rows = await loadActivitiesObjectsCached(activitesSheet, { full });
+    const target = String(id);
+    for (const obj of rows) {
+      const m = objectToLowerMap(obj);
+      let rid = "";
+      for (const [k, v] of m.entries()) {
+        if (normHeader(baseKey(k)) === "id") {
+          rid = String(v ?? "").trim();
+          break;
+        }
       }
+      if (rid === target) return obj;
     }
-    if (rid === target) {
-      return obj;
-    }
+    return null;
+  };
+
+  const hit = await tryFind(false);
+  if (hit) return hit;
+
+  // Full scan (optionnel) si la sheet n'est pas gigantesque.
+  const maxRows = getActivitiesFullScanMaxRows();
+  const rowCount = Math.trunc(activitesSheet.rowCount ?? 0);
+  if (rowCount > 0 && rowCount <= maxRows) {
+    return await tryFind(true);
   }
+
   return null;
 }
