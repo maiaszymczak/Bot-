@@ -11,6 +11,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   Routes,
 } from "discord.js";
 
@@ -22,6 +23,7 @@ import {
   bulkUpsertUsers,
   countRegisteredUsers,
   getBalance,
+  getBalancesForDiscordId,
   getColumnSum,
   getSheetByName,
   getTopPlayers,
@@ -161,10 +163,20 @@ const SHEETS_META_TTL_MS = 5 * 60 * 1000;
 const SYNC_MEMBERS_TTL_MS = 10 * 60 * 1000;
 const pendingSyncMembers = new Map();
 
+const MONEY_CHOICE_TTL_MS = 10 * 60 * 1000;
+const pendingMoneyChoices = new Map();
+
 function cleanupPendingSyncMembers() {
   const now = Date.now();
   for (const [token, obj] of pendingSyncMembers.entries()) {
     if (!obj?.createdAt || now - obj.createdAt > SYNC_MEMBERS_TTL_MS) pendingSyncMembers.delete(token);
+  }
+}
+
+function cleanupPendingMoneyChoices() {
+  const now = Date.now();
+  for (const [token, obj] of pendingMoneyChoices.entries()) {
+    if (!obj?.createdAt || now - obj.createdAt > MONEY_CHOICE_TTL_MS) pendingMoneyChoices.delete(token);
   }
 }
 
@@ -525,6 +537,7 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 
 client.on("interactionCreate", async (interaction) => {
   cleanupPendingSyncMembers();
+  cleanupPendingMoneyChoices();
   if (interaction.guildId !== GUILD_ID) return;
 
   if (interaction.isButton()) {
@@ -594,6 +607,61 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (interaction.isStringSelectMenu()) {
+    const id = String(interaction.customId ?? "");
+    if (!id.startsWith("moneyacct:")) return;
+
+    if (!interaction.deferred && !interaction.replied) {
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } catch {
+        return;
+      }
+    }
+
+    const token = id.split(":")[1] ?? "";
+    const pending = token ? pendingMoneyChoices.get(token) : null;
+    if (!pending) {
+      await replyEphemeral(interaction, { content: "⏳ Choix expiré. Relance `/money`." });
+      return;
+    }
+    if (pending.userId !== interaction.user.id) {
+      await replyEphemeral(interaction, { content: "❌ Seule la personne qui a lancé `/money` peut choisir." });
+      return;
+    }
+
+    const picked = String(interaction.values?.[0] ?? "");
+    const idx = Number(picked);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= pending.accounts.length) {
+      await replyEphemeral(interaction, { content: "Choix invalide." });
+      return;
+    }
+
+    pendingMoneyChoices.delete(token);
+    const bal = pending.accounts[idx];
+    const user = pending.targetUser;
+
+    const guildName = interaction.guild?.name ?? "Guilde";
+    const aventurier = (bal?.name || user?.username || "-").trim();
+    const stripEuro = (s) => (s || "0").trim().replace(/\s*€\s*$/, "").trim();
+    const soldeRaw = stripEuro(bal?.balance);
+    const cumulRaw = stripEuro(bal?.cumulative);
+    const embed = new EmbedBuilder()
+      .setTitle(`🏦 Bank - ${guildName} -`)
+      .setDescription("Voici le contenu de ton coffre de guilde")
+      .addFields(
+        { name: "👤 Aventurier", value: aventurier || "-", inline: false },
+        { name: "💰 Portefeuille", value: `${soldeRaw} silvers`, inline: false },
+        { name: "📈 Cumul", value: `${cumulRaw} silvers`, inline: false }
+      )
+      .setFooter({
+        text: "Veuillez contacter un membre du staff pour récupérer vos gains",
+      });
+
+    await replyEphemeral(interaction, { embeds: [embed] });
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   if (!interaction.deferred && !interaction.replied) {
@@ -641,8 +709,8 @@ client.on("interactionCreate", async (interaction) => {
           return null;
         }
       })();
-      let bal = await getBalance(joueursSheet, user.id);
-      if (!bal) {
+      const bals = await getBalancesForDiscordId(joueursSheet, user.id);
+      if (!bals.length) {
         const hint =
           user.id === interaction.user.id
             ? "\n➡️  Fais `/register` pour t'ajouter automatiquement."
@@ -652,6 +720,36 @@ client.on("interactionCreate", async (interaction) => {
         });
         return;
       }
+
+      // Plusieurs comptes (ex: double compte Albion) -> on demande lequel afficher.
+      if (bals.length > 1) {
+        const token = makeToken();
+        pendingMoneyChoices.set(token, {
+          createdAt: Date.now(),
+          userId: interaction.user.id,
+          targetUser: { id: user.id, username: user.username },
+          accounts: bals,
+        });
+
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`moneyacct:${token}`)
+          .setPlaceholder("Choisis le compte")
+          .addOptions(
+            bals.slice(0, 25).map((b, i) => ({
+              label: String(b?.name || `Compte ${i + 1}`).slice(0, 100),
+              value: String(i),
+            }))
+          );
+
+        const row = new ActionRowBuilder().addComponents(menu);
+        await replyEphemeral(interaction, {
+          content: `🔎 Plusieurs comptes trouvés pour <@${user.id}>. Lequel afficher ?`,
+          components: [row],
+        });
+        return;
+      }
+
+      const bal = bals[0];
 
       const guildName = interaction.guild?.name ?? "Guilde";
       const aventurier = (memberDisplayName || bal.name || user.username || "-").trim();

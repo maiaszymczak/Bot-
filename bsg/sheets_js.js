@@ -703,7 +703,27 @@ export async function getBalance(joueursSheet, discordId) {
   const name = String(joueursSheet.getCell(row - 1, COL_NOM - 1).value ?? "").trim();
   const balance = readCellText(joueursSheet.getCell(row - 1, COL_SOLDE - 1));
   const cumulative = readCellText(joueursSheet.getCell(row - 1, COL_CUMUL - 1));
-  return { name, balance, cumulative };
+  return { name, balance, cumulative, row };
+}
+
+export async function getBalancesForDiscordId(joueursSheet, discordId) {
+  const target = String(discordId ?? "").trim();
+  if (!target) return [];
+
+  const startRow = getHeaderRows() + 1;
+  await loadFullJoueursSheet(joueursSheet);
+
+  const out = [];
+  for (let row = startRow; row <= joueursSheet.rowCount; row++) {
+    const id = String(joueursSheet.getCell(row - 1, COL_ID_DISCORD - 1).value ?? "").trim();
+    if (id !== target) continue;
+    const name = String(joueursSheet.getCell(row - 1, COL_NOM - 1).value ?? "").trim();
+    const balance = readCellText(joueursSheet.getCell(row - 1, COL_SOLDE - 1));
+    const cumulative = readCellText(joueursSheet.getCell(row - 1, COL_CUMUL - 1));
+    out.push({ row, name, balance, cumulative });
+  }
+
+  return out;
 }
 
 export async function listRegisteredDiscordUsers(joueursSheet) {
