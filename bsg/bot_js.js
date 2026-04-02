@@ -41,6 +41,13 @@ if (!GUILD_ID) throw new Error("GUILD_ID manquant (variable d'environnement)");
 const ROLE_ID = process.env.BSG_MEMBER_ROLE_ID || null;
 const ROLE_NAME = process.env.BSG_MEMBER_ROLE_NAME || "Membre";
 
+const BSG_REGISTER_PROMPT_ENABLED = parseBoolEnv(process.env.BSG_REGISTER_PROMPT_ENABLED, true);
+const BSG_REGISTER_PROMPT_COOLDOWN_HOURS = Number(process.env.BSG_REGISTER_PROMPT_COOLDOWN_HOURS ?? "24");
+const BSG_REGISTER_PROMPT_MESSAGE = String(
+  process.env.BSG_REGISTER_PROMPT_MESSAGE ??
+    "Bienvenue ! Pour être sûr d'être sur la sheet, fais la commande /register."
+);
+
 function parseBoolEnv(value, defaultValue = false) {
   if (value == null) return defaultValue;
   const s = String(value).trim().toLowerCase();
@@ -165,6 +172,17 @@ const pendingSyncMembers = new Map();
 
 const MONEY_CHOICE_TTL_MS = 10 * 60 * 1000;
 const pendingMoneyChoices = new Map();
+
+const REGISTER_PROMPT_TTL_MS =
+  (Number.isFinite(BSG_REGISTER_PROMPT_COOLDOWN_HOURS) ? BSG_REGISTER_PROMPT_COOLDOWN_HOURS : 24) * 60 * 60 * 1000;
+const recentRegisterPrompts = new Map();
+
+function cleanupRecentRegisterPrompts() {
+  const now = Date.now();
+  for (const [userId, ts] of recentRegisterPrompts.entries()) {
+    if (!ts || now - ts > REGISTER_PROMPT_TTL_MS) recentRegisterPrompts.delete(userId);
+  }
+}
 
 function cleanupPendingSyncMembers() {
   const now = Date.now();
@@ -506,6 +524,8 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   try {
     await ensureSheetsLoaded();
 
+    cleanupRecentRegisterPrompts();
+
     const oldHas = memberHasRole(oldMember);
     const newHas = memberHasRole(newMember);
     if (!oldHas && newHas) {
@@ -517,6 +537,18 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
         { updateNames: true, fillDefaultsForNewRows: true }
       );
       if (stats.filledIds || stats.created) console.log(`Ajout sheet: ${display} (${newMember.id})`);
+
+      if (BSG_REGISTER_PROMPT_ENABLED && BSG_REGISTER_PROMPT_MESSAGE.trim()) {
+        const lastSentAt = recentRegisterPrompts.get(String(newMember.id)) ?? 0;
+        if (!lastSentAt || Date.now() - lastSentAt > REGISTER_PROMPT_TTL_MS) {
+          try {
+            await newMember.send({ content: BSG_REGISTER_PROMPT_MESSAGE.trim() });
+            recentRegisterPrompts.set(String(newMember.id), Date.now());
+          } catch {
+            // DM impossible (privacy settings, etc.) -> ignore
+          }
+        }
+      }
     }
 
     const oldName = oldMember.displayName;
